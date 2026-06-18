@@ -385,6 +385,44 @@ EOF
     echo -e "${green}V2node HY2 port hopping applied.${plain}"
 }
 
+sync_v2node_masq_pages() {
+    echo -e "${green}Syncing V2node masquerade pages...${plain}"
+
+    local masq_root="/etc/v2node/masq"
+    mkdir -p "$masq_root"
+
+    cat > /tmp/v2node-masq-pages.list <<'EOF'
+gm|https://xn--54qr1i.xn--oor32f63hs9js55d.com/
+nnm|https://xn--i2r10aa.xn--oor32f63hs9js55d.com/
+ovo|https://ovo.xn--oor32f63hs9js55d.com/
+yiyuan|https://xn--4gq62f52gdss.xn--oor32f63hs9js55d.com/
+clash|https://clash.xn--oor32f63hs9js55d.com/
+pianyi|https://xn--wtq35pfyd55o.xn--oor32f63hs9js55d.com/
+EOF
+
+    local synced=0
+    local failed=0
+    while IFS='|' read -r site url; do
+        [[ -z "$site" || -z "$url" ]] && continue
+        mkdir -p "$masq_root/$site"
+        local tmp_file="$masq_root/$site/index.html.tmp"
+        local out_file="$masq_root/$site/index.html"
+        if curl -fsSL --connect-timeout 8 --max-time 20 "$url" -o "$tmp_file" && [[ -s "$tmp_file" ]]; then
+            mv "$tmp_file" "$out_file"
+            chmod 0644 "$out_file" >/dev/null 2>&1 || true
+            synced=$((synced + 1))
+        else
+            rm -f "$tmp_file"
+            failed=$((failed + 1))
+            echo -e "${yellow}Masquerade page sync failed: ${site}${plain}"
+        fi
+    done < /tmp/v2node-masq-pages.list
+    rm -f /tmp/v2node-masq-pages.list
+
+    echo -e "${green}V2node masquerade pages synced: ${synced} success, ${failed} failed.${plain}"
+    return 0
+}
+
 # 0: running, 1: not running, 2: not installed
 check_status() {
     if [[ ! -f /usr/local/v2node/v2node ]]; then
@@ -504,6 +542,7 @@ install_v2node() {
     mkdir /etc/v2node/ -p
     cp geoip.dat /etc/v2node/
     cp geosite.dat /etc/v2node/
+    sync_v2node_masq_pages
     if [[ x"${release}" == x"alpine" ]]; then
         rm /etc/init.d/v2node -f
         cat <<EOF > /etc/init.d/v2node

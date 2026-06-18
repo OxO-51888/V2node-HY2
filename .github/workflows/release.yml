@@ -162,6 +162,7 @@ jobs:
           do
             openssl dgst -$METHOD $FILE | sed 's/([^)]*)//g' >>$DGST
           done
+          sha256sum $FILE >$FILE.sha256
       - name: Change the name
         run: |
           mv build_assets v2node-$ASSET_NAME

@@ -3,9 +3,12 @@ package officialhy2
 import (
 	"crypto/tls"
 	"fmt"
+	"html"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +32,7 @@ const (
 	defaultMaxIncomingStreams  = 4096
 	defaultUDPIdleTimeout      = 60 * time.Second
 	defaultCertCheckInterval   = 5 * time.Second
+	defaultMasqRoot            = "/etc/v2node/masq"
 )
 
 type certificateCache struct {
@@ -49,6 +53,12 @@ type masqHandlerLogWrapper struct {
 	handler http.Handler
 	quic    bool
 	logger  *zap.Logger
+}
+
+type staticMasqHandler struct {
+	site        string
+	content     []byte
+	contentType string
 }
 
 func (m *masqHandlerLogWrapper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -264,11 +274,116 @@ func (n *Node) getOutboundConfig() server.Outbound {
 }
 
 func (n *Node) getMasqHandler() http.Handler {
+	handler := n.getStaticMasqHandler()
 	return &masqHandlerLogWrapper{
-		handler: http.NotFoundHandler(),
+		handler: handler,
 		quic:    true,
 		logger:  n.events.logger,
 	}
+}
+
+func (n *Node) getStaticMasqHandler() http.Handler {
+	site := n.masqSite()
+	if site == "" {
+		return defaultMasqHandler("v2node")
+	}
+	indexPath := filepath.Join(defaultMasqRoot, site, "index.html")
+	content, err := os.ReadFile(indexPath)
+	if err != nil || len(content) == 0 {
+		n.events.logger.Warn("masquerade page not found",
+			zap.String("tag", n.tag),
+			zap.String("site", site),
+			zap.String("path", indexPath),
+			zap.Error(err))
+		return defaultMasqHandler(site)
+	}
+	return &staticMasqHandler{
+		site:        site,
+		content:     content,
+		contentType: "text/html; charset=utf-8",
+	}
+}
+
+func (n *Node) masqSite() string {
+	if n.info == nil || n.info.Common == nil {
+		return ""
+	}
+	serverName := ""
+	if n.info.Common.CertInfo != nil {
+		serverName = strings.ToLower(n.info.Common.CertInfo.CertDomain)
+	}
+	if serverName == "" {
+		serverName = strings.ToLower(n.info.Common.TlsSettings.PrimaryServerName())
+	}
+	if site := masqSiteByName(serverName); site != "" {
+		return site
+	}
+	return masqSiteByPort(n.info.Common.ServerPort)
+}
+
+func (h *staticMasqHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", h.contentType)
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.Header().Set("X-Robots-Tag", "noindex")
+	_, _ = w.Write(h.content)
+}
+
+func defaultMasqHandler(site string) http.Handler {
+	content := []byte("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" +
+		html.EscapeString(site) +
+		"</title></head><body></body></html>")
+	return &staticMasqHandler{
+		site:        site,
+		content:     content,
+		contentType: "text/html; charset=utf-8",
+	}
+}
+
+func masqSiteByPort(port int) string {
+	switch port {
+	case 51801:
+		return "gm"
+	case 51802:
+		return "nnm"
+	case 51803:
+		return "ovo"
+	case 51804:
+		return "yiyuan"
+	case 51805:
+		return "clash"
+	case 51806:
+		return "pianyi"
+	default:
+		return ""
+	}
+}
+
+func masqSiteByName(name string) string {
+	name = strings.TrimSuffix(strings.TrimSpace(strings.ToLower(name)), ".")
+	if name == "" {
+		return ""
+	}
+	firstLabel := strings.Split(name, ".")[0]
+	switch firstLabel {
+	case "gm", "nnm", "ovo", "yiyuan", "clash", "pianyi":
+		return firstLabel
+	case "xn--54qr1i":
+		return "gm"
+	case "xn--i2r10aa":
+		return "nnm"
+	case "xn--4gq62f52gdss":
+		return "yiyuan"
+	case "xn--wtq35pfyd55o":
+		return "pianyi"
+	}
+	if port, err := strconv.Atoi(firstLabel); err == nil {
+		return masqSiteByPort(port)
+	}
+	return ""
 }
 
 func formatAddress(ip string, port int) string {
