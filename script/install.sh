@@ -204,21 +204,21 @@ apply_v2node_network_tuning() {
     cat > "$sysctl_file" <<'EOF'
 # V2node speed tuning. Managed by V2node install script.
 net.core.default_qdisc = fq
-net.core.netdev_max_backlog = 250000
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 8388608
-net.core.wmem_default = 8388608
+net.core.netdev_max_backlog = 125000
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
 net.core.optmem_max = 65536
-net.core.rps_sock_flow_entries = 32768
+net.core.rps_sock_flow_entries = 16384
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
 net.ipv4.ip_local_port_range = 10000 65000
-net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_max = 524288
 EOF
 
     touch /etc/sysctl.conf
@@ -258,15 +258,15 @@ else
     mask="$(printf '%x' "$(( (1 << cpu_count) - 1 ))")"
 fi
 
-echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+echo 16384 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 
 for queue in /sys/class/net/"$iface"/queues/rx-*; do
     [ -d "$queue" ] || continue
     echo "$mask" > "$queue/rps_cpus" 2>/dev/null || true
-    echo 8192 > "$queue/rps_flow_cnt" 2>/dev/null || true
+    echo 4096 > "$queue/rps_flow_cnt" 2>/dev/null || true
 done
 
-ip link set dev "$iface" txqueuelen 5000 2>/dev/null || true
+ip link set dev "$iface" txqueuelen 3000 2>/dev/null || true
 EOF
     chmod +x /usr/local/sbin/v2node-net-queues.sh
     /usr/local/sbin/v2node-net-queues.sh >/dev/null 2>&1 || true

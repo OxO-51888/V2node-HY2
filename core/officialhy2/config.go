@@ -26,9 +26,9 @@ const (
 	kilobyteSize = byteSize * 1000
 	megabyteSize = kilobyteSize * 1000
 
-	defaultStreamReceiveWindow = 16777216
-	defaultConnReceiveWindow   = 41943040
-	defaultMaxIdleTimeout      = 90 * time.Second
+	defaultStreamReceiveWindow = 8388608
+	defaultConnReceiveWindow   = 25165824
+	defaultMaxIdleTimeout      = 60 * time.Second
 	defaultMaxIncomingStreams  = 4096
 	defaultUDPIdleTimeout      = 60 * time.Second
 	defaultCertCheckInterval   = 5 * time.Second
@@ -90,8 +90,7 @@ func (n *Node) buildConfig(info *panel.NodeInfo) (*server.Config, error) {
 		Conn:       conn,
 		Outbound:   outbound,
 		CongestionConfig: server.CongestionConfig{
-			Type:       "bbr",
-			BBRProfile: "aggressive",
+			Type: "bbr",
 		},
 		BandwidthConfig:       *n.getBandwidthConfig(info),
 		IgnoreClientBandwidth: info.Common.Ignore_Client_Bandwidth,
