@@ -27,6 +27,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 				return err
 			}
 		} else {
+			c.server.CommitUserTraffic(c.tag, userTraffic)
 			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
 			//log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
 		}

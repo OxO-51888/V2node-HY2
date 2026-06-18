@@ -38,6 +38,13 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 	return trafficSlice, nil
 }
 
+func (vc *V2Core) CommitUserTraffic(tag string, reported []panel.UserTraffic) {
+	if len(reported) == 0 || !vc.hy2.HasNode(tag) {
+		return
+	}
+	vc.hy2.CommitUserTraffic(tag, reported)
+}
+
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 	if p == nil || p.NodeInfo == nil {
 		return 0, fmt.Errorf("empty add users params")

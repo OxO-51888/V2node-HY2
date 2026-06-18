@@ -124,6 +124,7 @@ type UserTraffic struct {
 	UID      int
 	Upload   int64
 	Download int64
+	UUID     string `json:"-" msgpack:"-"`
 }
 
 // ReportUserTraffic reports the user traffic
@@ -133,7 +134,7 @@ func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffi
 		data[userTraffic[i].UID] = []int64{userTraffic[i].Upload, userTraffic[i].Download}
 	}
 	const path = "/api/v1/server/UniProxy/push"
-	_, err := c.client.R().
+	r, err := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
@@ -141,12 +142,19 @@ func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffi
 	if err != nil {
 		return err
 	}
+	code := 0
+	if r != nil {
+		code = r.StatusCode()
+	}
+	if code == 0 || code >= 400 {
+		return fmt.Errorf("report user traffic failed with status %d", code)
+	}
 	return nil
 }
 
 func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]string) error {
 	const path = "/api/v1/server/UniProxy/alive"
-	_, err := c.client.R().
+	r, err := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
@@ -154,6 +162,13 @@ func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]stri
 
 	if err != nil {
 		return err
+	}
+	code := 0
+	if r != nil {
+		code = r.StatusCode()
+	}
+	if code == 0 || code >= 400 {
+		return fmt.Errorf("report online users failed with status %d", code)
 	}
 
 	return nil

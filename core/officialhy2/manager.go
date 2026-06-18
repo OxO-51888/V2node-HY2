@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
 	"github.com/OxO-51888/V2node-HY2/common/counter"
@@ -21,11 +22,16 @@ type Manager struct {
 }
 
 type Node struct {
-	server  server.Server
-	tag     string
-	auth    *Authenticator
-	events  *eventLogger
-	traffic *trafficLogger
+	server    server.Server
+	tag       string
+	info      *panel.NodeInfo
+	auth      *Authenticator
+	events    *eventLogger
+	traffic   *trafficLogger
+	serverMu  sync.Mutex
+	stopCh    chan struct{}
+	serveDone chan struct{}
+	stopOnce  sync.Once
 }
 
 type Authenticator struct {
@@ -72,35 +78,28 @@ func (m *Manager) AddNode(tag string, info *panel.NodeInfo) error {
 		tag:  tag,
 		auth: &Authenticator{users: make(map[string]int)},
 		events: &eventLogger{
-			tag:    tag,
-			logger: m.logger,
+			tag:                  tag,
+			logger:               m.logger,
+			limitCheckCacheTTL:   defaultLimitCheckCacheTTL,
+			limitCacheSweepEvery: defaultLimitCacheSweepEvery,
 		},
 		traffic: &trafficLogger{
 			tag:     tag,
 			logger:  m.logger,
 			counter: counter.NewTrafficCounter(),
 		},
+		info:      info,
+		stopCh:    make(chan struct{}),
+		serveDone: make(chan struct{}),
 	}
-	hyConfig, err := n.buildConfig(info)
-	if err != nil {
-		return err
-	}
-	hyConfig.Authenticator = n.auth
-	s, err := server.NewServer(hyConfig)
+	s, err := n.newServer()
 	if err != nil {
 		return err
 	}
 	n.server = s
 	m.nodes[tag] = n
 
-	go func() {
-		if err := s.Serve(); err != nil && !strings.Contains(err.Error(), "quic: server closed") {
-			log.WithFields(log.Fields{
-				"tag": tag,
-				"err": err,
-			}).Error("official hysteria2 server error")
-		}
-	}()
+	go n.serveLoop()
 	return nil
 }
 
@@ -114,7 +113,7 @@ func (m *Manager) DelNode(tag string) error {
 	if !ok {
 		return fmt.Errorf("hysteria2 node %s not found", tag)
 	}
-	return n.server.Close()
+	return n.stop()
 }
 
 func (m *Manager) Close() error {
@@ -123,12 +122,19 @@ func (m *Manager) Close() error {
 	m.nodes = make(map[string]*Node)
 	m.mu.Unlock()
 
+	var closeErr error
 	for tag, node := range nodes {
-		if err := node.server.Close(); err != nil {
-			return fmt.Errorf("close hysteria2 node %s: %w", tag, err)
+		if err := node.stop(); err != nil {
+			log.WithFields(log.Fields{
+				"tag": tag,
+				"err": err,
+			}).Error("close hysteria2 node failed")
+			if closeErr == nil {
+				closeErr = fmt.Errorf("close hysteria2 node %s: %w", tag, err)
+			}
 		}
 	}
-	return nil
+	return closeErr
 }
 
 func (m *Manager) AddUsers(tag string, users []panel.UserInfo) (int, error) {
@@ -157,6 +163,7 @@ func (m *Manager) DelUsers(tag string, users []panel.UserInfo) error {
 	defer n.auth.mu.Unlock()
 	for _, user := range users {
 		delete(n.auth.users, user.Uuid)
+		n.traffic.counter.Delete(user.Uuid)
 	}
 	return nil
 }
@@ -178,8 +185,6 @@ func (m *Manager) GetUserTrafficSlice(tag string, minTraffic int, uidForUUID fun
 		if up+down <= int64(minTraffic*1000) {
 			return true
 		}
-		traffic.UpCounter.Store(0)
-		traffic.DownCounter.Store(0)
 
 		uid := uidForUUID(uuid)
 		if uid == 0 {
@@ -190,12 +195,142 @@ func (m *Manager) GetUserTrafficSlice(tag string, minTraffic int, uidForUUID fun
 			UID:      uid,
 			Upload:   up,
 			Download: down,
+			UUID:     uuid,
 		})
 		return true
 	})
 	return trafficSlice
 }
 
+func (m *Manager) CommitUserTraffic(tag string, reported []panel.UserTraffic) {
+	m.mu.RLock()
+	n, ok := m.nodes[tag]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	for _, traffic := range reported {
+		if traffic.UUID == "" {
+			continue
+		}
+		n.traffic.counter.Subtract(traffic.UUID, traffic.Upload, traffic.Download)
+	}
+}
+
 func userTag(tag, uuid string) string {
 	return format.UserTag(tag, uuid)
+}
+
+func (n *Node) newServer() (server.Server, error) {
+	hyConfig, err := n.buildConfig(n.info)
+	if err != nil {
+		return nil, err
+	}
+	hyConfig.Authenticator = n.auth
+	return server.NewServer(hyConfig)
+}
+
+func (n *Node) serveLoop() {
+	defer close(n.serveDone)
+
+	backoff := time.Second
+	for {
+		n.serverMu.Lock()
+		s := n.server
+		n.serverMu.Unlock()
+		if s == nil {
+			return
+		}
+
+		err := s.Serve()
+		select {
+		case <-n.stopCh:
+			return
+		default:
+		}
+
+		if err != nil && !isServerClosedError(err) {
+			log.WithFields(log.Fields{
+				"tag": n.tag,
+				"err": err,
+			}).Error("official hysteria2 server stopped unexpectedly")
+		} else {
+			log.WithField("tag", n.tag).Warn("official hysteria2 server stopped unexpectedly")
+		}
+
+		_ = n.closeServer()
+		if !n.waitBeforeRestart(backoff) {
+			return
+		}
+
+		nextServer, err := n.newServer()
+		if err != nil {
+			log.WithFields(log.Fields{
+				"tag":     n.tag,
+				"err":     err,
+				"backoff": backoff.String(),
+			}).Error("restart official hysteria2 server failed")
+			backoff = nextRestartBackoff(backoff)
+			continue
+		}
+		n.serverMu.Lock()
+		n.server = nextServer
+		n.serverMu.Unlock()
+		log.WithField("tag", n.tag).Warn("official hysteria2 server restarted")
+		backoff = time.Second
+	}
+}
+
+func (n *Node) waitBeforeRestart(backoff time.Duration) bool {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-n.stopCh:
+		return false
+	}
+}
+
+func nextRestartBackoff(current time.Duration) time.Duration {
+	next := current * 2
+	if next > 30*time.Second {
+		return 30 * time.Second
+	}
+	return next
+}
+
+func (n *Node) stop() error {
+	var closeErr error
+	n.stopOnce.Do(func() {
+		close(n.stopCh)
+		closeErr = n.closeServer()
+		select {
+		case <-n.serveDone:
+		case <-time.After(5 * time.Second):
+			log.WithField("tag", n.tag).Warn("timed out waiting for hysteria2 server goroutine to stop")
+		}
+	})
+	return closeErr
+}
+
+func (n *Node) closeServer() error {
+	n.serverMu.Lock()
+	s := n.server
+	n.server = nil
+	n.serverMu.Unlock()
+	if s == nil {
+		return nil
+	}
+	if err := s.Close(); err != nil && !isServerClosedError(err) {
+		return err
+	}
+	return nil
+}
+
+func isServerClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "quic: server closed")
 }

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
@@ -26,7 +28,22 @@ const (
 	defaultMaxIdleTimeout      = 90 * time.Second
 	defaultMaxIncomingStreams  = 4096
 	defaultUDPIdleTimeout      = 60 * time.Second
+	defaultCertCheckInterval   = 5 * time.Second
 )
+
+type certificateCache struct {
+	certFile      string
+	keyFile       string
+	checkInterval time.Duration
+
+	mu          sync.RWMutex
+	cert        tls.Certificate
+	certModTime time.Time
+	keyModTime  time.Time
+	certSize    int64
+	keySize     int64
+	lastCheck   time.Time
+}
 
 type masqHandlerLogWrapper struct {
 	handler http.Handler
@@ -58,10 +75,10 @@ func (n *Node) buildConfig(info *panel.NodeInfo) (*server.Config, error) {
 	masqHandler := n.getMasqHandler()
 
 	return &server.Config{
-		TLSConfig:             *tlsConfig,
-		QUICConfig:            *quicConfig,
-		Conn:                  conn,
-		Outbound:              outbound,
+		TLSConfig:  *tlsConfig,
+		QUICConfig: *quicConfig,
+		Conn:       conn,
+		Outbound:   outbound,
 		CongestionConfig: server.CongestionConfig{
 			Type:       "bbr",
 			BBRProfile: "aggressive",
@@ -85,18 +102,97 @@ func (n *Node) getTLSConfig(info *panel.NodeInfo) (*server.TLSConfig, error) {
 	case "none", "":
 		return nil, fmt.Errorf("hysteria2 cert mode cannot be none")
 	default:
-		cert, err := tls.LoadX509KeyPair(certInfo.CertFile, certInfo.KeyFile)
+		certCache, err := newCertificateCache(certInfo.CertFile, certInfo.KeyFile, defaultCertCheckInterval)
 		if err != nil {
 			return nil, err
 		}
 		return &server.TLSConfig{
-			Certificates: []tls.Certificate{cert},
-			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-				cert, err := tls.LoadX509KeyPair(certInfo.CertFile, certInfo.KeyFile)
-				return &cert, err
-			},
+			Certificates:   []tls.Certificate{certCache.current()},
+			GetCertificate: certCache.GetCertificate,
 		}, nil
 	}
+}
+
+func newCertificateCache(certFile, keyFile string, checkInterval time.Duration) (*certificateCache, error) {
+	cache := &certificateCache{
+		certFile:      certFile,
+		keyFile:       keyFile,
+		checkInterval: checkInterval,
+	}
+	if err := cache.reloadLocked(); err != nil {
+		return nil, err
+	}
+	return cache, nil
+}
+
+func (c *certificateCache) current() tls.Certificate {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cert
+}
+
+func (c *certificateCache) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	now := time.Now()
+	c.mu.RLock()
+	if now.Sub(c.lastCheck) < c.checkInterval {
+		cert := c.cert
+		c.mu.RUnlock()
+		return &cert, nil
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if now.Sub(c.lastCheck) >= c.checkInterval {
+		if changed, err := c.changedLocked(); err != nil {
+			c.lastCheck = now
+		} else if changed {
+			if err := c.reloadLocked(); err != nil {
+				c.lastCheck = now
+			}
+		} else {
+			c.lastCheck = now
+		}
+	}
+	cert := c.cert
+	return &cert, nil
+}
+
+func (c *certificateCache) changedLocked() (bool, error) {
+	certStat, err := os.Stat(c.certFile)
+	if err != nil {
+		return false, err
+	}
+	keyStat, err := os.Stat(c.keyFile)
+	if err != nil {
+		return false, err
+	}
+	return !certStat.ModTime().Equal(c.certModTime) ||
+		!keyStat.ModTime().Equal(c.keyModTime) ||
+		certStat.Size() != c.certSize ||
+		keyStat.Size() != c.keySize, nil
+}
+
+func (c *certificateCache) reloadLocked() error {
+	cert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
+	if err != nil {
+		return err
+	}
+	certStat, err := os.Stat(c.certFile)
+	if err != nil {
+		return err
+	}
+	keyStat, err := os.Stat(c.keyFile)
+	if err != nil {
+		return err
+	}
+	c.cert = cert
+	c.certModTime = certStat.ModTime()
+	c.keyModTime = keyStat.ModTime()
+	c.certSize = certStat.Size()
+	c.keySize = keyStat.Size()
+	c.lastCheck = time.Now()
+	return nil
 }
 
 func (n *Node) getQUICConfig() *server.QUICConfig {

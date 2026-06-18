@@ -4,15 +4,32 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/OxO-51888/V2node-HY2/limiter"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
+const (
+	defaultLimitCheckCacheTTL   = 2 * time.Second
+	defaultLimitCacheSweepEvery = time.Minute
+)
+
 type eventLogger struct {
-	tag    string
-	logger *zap.Logger
+	tag                  string
+	logger               *zap.Logger
+	limitCache           sync.Map
+	lastLimitCacheSweep  atomic.Int64
+	limitCheckCacheTTL   time.Duration
+	limitCacheSweepEvery time.Duration
+}
+
+type limitCacheEntry struct {
+	reject    bool
+	expiresAt time.Time
 }
 
 func (l *eventLogger) Connect(addr net.Addr, uuid string, tx uint64) {
@@ -51,15 +68,63 @@ func (l *eventLogger) UDPError(addr net.Addr, uuid string, sessionID uint32, err
 }
 
 func (l *eventLogger) checkLimit(addr net.Addr, uuid string) {
+	ip := extractIPFromAddr(addr)
+	cacheKey := uuid + "|" + ip + "|" + addr.Network()
+	now := time.Now()
+	if cached, ok := l.limitCache.Load(cacheKey); ok {
+		entry := cached.(limitCacheEntry)
+		if now.Before(entry.expiresAt) {
+			if entry.reject {
+				l.setUserOverLimit(uuid, true)
+			}
+			return
+		}
+		l.limitCache.Delete(cacheKey)
+	}
+
 	limiterInfo, err := limiter.GetLimiter(l.tag)
 	if err != nil {
 		l.logger.Error("get limiter error", zap.String("tag", l.tag), zap.Error(err))
 		return
 	}
-	_, reject := limiterInfo.CheckLimit(userTag(l.tag, uuid), extractIPFromAddr(addr), addr.Network() == "tcp")
-	if userLimit, ok := limiterInfo.UserLimitInfo.Load(userTag(l.tag, uuid)); ok {
+	_, reject := limiterInfo.CheckLimit(userTag(l.tag, uuid), ip, addr.Network() == "tcp")
+	l.limitCache.Store(cacheKey, limitCacheEntry{
+		reject:    reject,
+		expiresAt: now.Add(l.limitCheckCacheTTL),
+	})
+	setLimiterOverLimit(limiterInfo, l.tag, uuid, reject)
+	l.sweepLimitCache(now)
+}
+
+func (l *eventLogger) setUserOverLimit(uuid string, reject bool) {
+	limiterInfo, err := limiter.GetLimiter(l.tag)
+	if err != nil {
+		l.logger.Error("get limiter error", zap.String("tag", l.tag), zap.Error(err))
+		return
+	}
+	setLimiterOverLimit(limiterInfo, l.tag, uuid, reject)
+}
+
+func setLimiterOverLimit(limiterInfo *limiter.Limiter, tag, uuid string, reject bool) {
+	if userLimit, ok := limiterInfo.UserLimitInfo.Load(userTag(tag, uuid)); ok {
 		userLimit.(*limiter.UserLimitInfo).OverLimit = reject
 	}
+}
+
+func (l *eventLogger) sweepLimitCache(now time.Time) {
+	last := l.lastLimitCacheSweep.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < l.limitCacheSweepEvery {
+		return
+	}
+	if !l.lastLimitCacheSweep.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	l.limitCache.Range(func(key, value interface{}) bool {
+		if now.After(value.(limitCacheEntry).expiresAt) {
+			l.limitCache.Delete(key)
+		}
+		return true
+	})
 }
 
 func newLogger(level string) (*zap.Logger, error) {
