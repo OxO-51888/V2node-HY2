@@ -196,6 +196,195 @@ install_base() {
     fi
 }
 
+apply_v2node_network_tuning() {
+    echo -e "${green}Applying V2node network tuning...${plain}"
+
+    local sysctl_file="/etc/sysctl.d/99-v2node-speed.conf"
+    mkdir -p /etc/sysctl.d
+    cat > "$sysctl_file" <<'EOF'
+# V2node speed tuning. Managed by V2node install script.
+net.core.default_qdisc = fq
+net.core.netdev_max_backlog = 250000
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 8388608
+net.core.wmem_default = 8388608
+net.core.optmem_max = 65536
+net.core.rps_sock_flow_entries = 32768
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.ip_local_port_range = 10000 65000
+net.netfilter.nf_conntrack_max = 1048576
+EOF
+
+    touch /etc/sysctl.conf
+    sed -i '/^# BEGIN V2node speed tuning$/,/^# END V2node speed tuning$/d' /etc/sysctl.conf
+    {
+        echo ""
+        echo "# BEGIN V2node speed tuning"
+        cat "$sysctl_file"
+        echo "# END V2node speed tuning"
+    } >> /etc/sysctl.conf
+
+    sysctl -p "$sysctl_file" >/dev/null 2>&1 || true
+    while IFS= read -r line; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        sysctl -w "$line" >/dev/null 2>&1 || true
+    done < "$sysctl_file"
+
+    mkdir -p /usr/local/sbin
+    cat > /usr/local/sbin/v2node-net-queues.sh <<'EOF'
+#!/bin/sh
+set -eu
+
+iface="${1:-$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')}"
+[ -n "$iface" ] || exit 0
+[ -d "/sys/class/net/$iface" ] || exit 0
+
+cpu_count="$(nproc 2>/dev/null || echo 1)"
+case "$cpu_count" in
+    ''|*[!0-9]*) cpu_count=1 ;;
+esac
+
+if [ "$cpu_count" -ge 32 ]; then
+    mask="ffffffff"
+else
+    mask="$(printf '%x' "$(( (1 << cpu_count) - 1 ))")"
+fi
+
+echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+
+for queue in /sys/class/net/"$iface"/queues/rx-*; do
+    [ -d "$queue" ] || continue
+    echo "$mask" > "$queue/rps_cpus" 2>/dev/null || true
+    echo 8192 > "$queue/rps_flow_cnt" 2>/dev/null || true
+done
+
+ip link set dev "$iface" txqueuelen 5000 2>/dev/null || true
+EOF
+    chmod +x /usr/local/sbin/v2node-net-queues.sh
+    /usr/local/sbin/v2node-net-queues.sh >/dev/null 2>&1 || true
+
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > /etc/systemd/system/v2node-net-queues.service <<'EOF'
+[Unit]
+Description=V2node network queue tuning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/v2node-net-queues.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now v2node-net-queues.service >/dev/null 2>&1 || true
+    fi
+
+    if ! command -v irqbalance >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y irqbalance >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y irqbalance >/dev/null 2>&1 || true
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache irqbalance >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -S --noconfirm --needed irqbalance >/dev/null 2>&1 || true
+        fi
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now irqbalance >/dev/null 2>&1 || true
+    elif command -v rc-update >/dev/null 2>&1; then
+        rc-update add irqbalance default >/dev/null 2>&1 || true
+        service irqbalance start >/dev/null 2>&1 || true
+    fi
+
+    echo -e "${green}V2node network tuning applied.${plain}"
+}
+
+apply_v2node_port_hopping() {
+    echo -e "${green}Applying V2node HY2 port hopping...${plain}"
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y iptables >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y iptables >/dev/null 2>&1 || true
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache iptables >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -S --noconfirm --needed iptables >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo -e "${yellow}iptables not found, skip V2node HY2 port hopping.${plain}"
+        return 0
+    fi
+
+    mkdir -p /usr/local/sbin
+    cat > /usr/local/sbin/v2node-hy2-porthop.sh <<'EOF'
+#!/bin/sh
+set -eu
+
+CHAIN="V2NODE_HY2_HOP"
+
+while iptables -t nat -D PREROUTING -p udp --dport 51820:51920 -j REDIRECT --to-ports 51806 2>/dev/null; do
+    :
+done
+
+iptables -t nat -N "$CHAIN" 2>/dev/null || iptables -t nat -F "$CHAIN"
+while iptables -t nat -C PREROUTING -p udp -j "$CHAIN" 2>/dev/null; do
+    iptables -t nat -D PREROUTING -p udp -j "$CHAIN" 2>/dev/null || break
+done
+iptables -t nat -I PREROUTING 1 -p udp -j "$CHAIN"
+
+iptables -t nat -A "$CHAIN" -p udp --dport 55001:60000 -m comment --comment "v2node-gm-51801" -j REDIRECT --to-ports 51801
+iptables -t nat -A "$CHAIN" -p udp --dport 50001:55000 -m comment --comment "v2node-nnm-51802" -j REDIRECT --to-ports 51802
+iptables -t nat -A "$CHAIN" -p udp --dport 45001:50000 -m comment --comment "v2node-ovo-51803" -j REDIRECT --to-ports 51803
+iptables -t nat -A "$CHAIN" -p udp --dport 40001:45000 -m comment --comment "v2node-yiyuan-51804" -j REDIRECT --to-ports 51804
+iptables -t nat -A "$CHAIN" -p udp --dport 35001:40000 -m comment --comment "v2node-clash-51805" -j REDIRECT --to-ports 51805
+iptables -t nat -A "$CHAIN" -p udp --dport 30001:35000 -m comment --comment "v2node-pianyi-51806" -j REDIRECT --to-ports 51806
+EOF
+    chmod +x /usr/local/sbin/v2node-hy2-porthop.sh
+
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > /etc/systemd/system/v2node-hy2-porthop.service <<'EOF'
+[Unit]
+Description=V2node HY2 UDP port hopping redirect
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/v2node-hy2-porthop.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now v2node-hy2-porthop.service >/dev/null 2>&1 || true
+    else
+        /usr/local/sbin/v2node-hy2-porthop.sh >/dev/null 2>&1 || true
+        if command -v crontab >/dev/null 2>&1; then
+            (crontab -l 2>/dev/null | grep -v '/usr/local/sbin/v2node-hy2-porthop.sh' || true; echo '@reboot /usr/local/sbin/v2node-hy2-porthop.sh >/dev/null 2>&1') | crontab -
+        fi
+    fi
+
+    /usr/local/sbin/v2node-hy2-porthop.sh >/dev/null 2>&1 || true
+    echo -e "${green}V2node HY2 port hopping applied.${plain}"
+}
+
 # 0: running, 1: not running, 2: not installed
 check_status() {
     if [[ ! -f /usr/local/v2node/v2node ]]; then
@@ -267,22 +456,42 @@ install_v2node() {
     cd /usr/local/v2node/
 
     if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/OxO-51888/V2node-HY2/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$last_version" ]]; then
-            echo -e "${red}检测 v2node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 v2node 版本安装${plain}"
-            exit 1
-        fi
-        echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        url="https://github.com/OxO-51888/V2node-HY2/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
-            exit 1
+        if [[ "$arch" == "64" ]]; then
+            last_version="officialhy2"
+            url="https://github.com/OxO-51888/V2node-HY2/releases/latest/download/v2node-linux-64.zip"
+            sha_url="${url}.sha256"
+            echo -e "${green}安装自用版：v2node official-hy2，开始下载...${plain}"
+            curl -fLs "$url" | pv -s 32M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
+            if [[ $? -ne 0 ]]; then
+                echo -e "${red}?? v2node official-hy2 ??,??? GitHub Release ??${plain}"
+                exit 1
+            fi
+            if command -v sha256sum >/dev/null 2>&1; then
+                curl -fLs "$sha_url" -o /usr/local/v2node/v2node-linux.zip.sha256 >/dev/null 2>&1 && \
+                sed -i 's/  .*/  v2node-linux.zip/' /usr/local/v2node/v2node-linux.zip.sha256 && \
+                (cd /usr/local/v2node && sha256sum -c v2node-linux.zip.sha256 >/dev/null 2>&1) || {
+                    echo -e "${red}v2node official-hy2 校验失败${plain}"
+                    exit 1
+                }
+            fi
+        else
+            last_version=$(curl -Ls "https://api.github.com/repos/OxO-51888/V2node-HY2/releases/latest" | grep '"tag_name":' | cut -d '"' -f 4)
+            if [[ ! -n "$last_version" ]]; then
+                echo -e "${red}检测 v2node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 v2node 版本安装${plain}"
+                exit 1
+            fi
+            echo -e "${yellow}当前架构 ${arch} 暂无自用 official-hy2 包，回退安装官方版本：${last_version}${plain}"
+            url="https://github.com/OxO-51888/V2node-HY2/releases/download/${last_version}/v2node-linux-${arch}.zip"
+            curl -fLs "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
+            if [[ $? -ne 0 ]]; then
+                echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
+                exit 1
+            fi
         fi
     else
-    last_version=$version_param
+        last_version=$version_param
         url="https://github.com/OxO-51888/V2node-HY2/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
+        curl -fLs "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
             exit 1
@@ -347,6 +556,9 @@ EOF
         echo -e "${green}v2node ${last_version}${plain} 安装完成，已设置开机自启"
     fi
 
+    apply_v2node_network_tuning
+    apply_v2node_port_hopping
+
     if [[ ! -f /etc/v2node/config.json ]]; then
         # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互
         if [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
@@ -392,6 +604,7 @@ EOF
     echo "v2node disable      - 取消 v2node 开机自启"
     echo "v2node log          - 查看 v2node 日志"
     echo "v2node generate     - 生成 v2node 配置文件"
+    echo "v2node tune         - 套用 V2node 网络优化"
     echo "v2node update       - 更新 v2node"
     echo "v2node update x.x.x - 更新 v2node 指定版本"
     echo "v2node install      - 安装 v2node"
