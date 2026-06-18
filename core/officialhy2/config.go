@@ -371,14 +371,6 @@ func masqSiteByName(name string) string {
 	switch firstLabel {
 	case "gm", "nnm", "ovo", "yiyuan", "clash", "pianyi":
 		return firstLabel
-	case "xn--54qr1i":
-		return "gm"
-	case "xn--i2r10aa":
-		return "nnm"
-	case "xn--4gq62f52gdss":
-		return "yiyuan"
-	case "xn--wtq35pfyd55o":
-		return "pianyi"
 	}
 	if port, err := strconv.Atoi(firstLabel); err == nil {
 		return masqSiteByPort(port)

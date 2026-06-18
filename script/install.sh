@@ -386,19 +386,22 @@ EOF
 }
 
 sync_v2node_masq_pages() {
-    echo -e "${green}Syncing V2node masquerade pages...${plain}"
-
     local masq_root="/etc/v2node/masq"
     mkdir -p "$masq_root"
 
-    cat > /tmp/v2node-masq-pages.list <<'EOF'
-gm|https://xn--54qr1i.xn--oor32f63hs9js55d.com/
-nnm|https://xn--i2r10aa.xn--oor32f63hs9js55d.com/
-ovo|https://ovo.xn--oor32f63hs9js55d.com/
-yiyuan|https://xn--4gq62f52gdss.xn--oor32f63hs9js55d.com/
-clash|https://clash.xn--oor32f63hs9js55d.com/
-pianyi|https://xn--wtq35pfyd55o.xn--oor32f63hs9js55d.com/
-EOF
+    if [[ -z "${V2NODE_MASQ_PAGES:-}" && -z "${V2NODE_MASQ_PAGES_FILE:-}" ]]; then
+        echo -e "${yellow}No masquerade page list configured, using backend default pages.${plain}"
+        return 0
+    fi
+
+    echo -e "${green}Syncing V2node masquerade pages...${plain}"
+
+    local list_file="/tmp/v2node-masq-pages.list"
+    if [[ -n "${V2NODE_MASQ_PAGES_FILE:-}" && -f "${V2NODE_MASQ_PAGES_FILE}" ]]; then
+        cp "${V2NODE_MASQ_PAGES_FILE}" "$list_file"
+    else
+        printf '%s\n' "${V2NODE_MASQ_PAGES}" > "$list_file"
+    fi
 
     local synced=0
     local failed=0
@@ -416,8 +419,8 @@ EOF
             failed=$((failed + 1))
             echo -e "${yellow}Masquerade page sync failed: ${site}${plain}"
         fi
-    done < /tmp/v2node-masq-pages.list
-    rm -f /tmp/v2node-masq-pages.list
+    done < "$list_file"
+    rm -f "$list_file"
 
     echo -e "${green}V2node masquerade pages synced: ${synced} success, ${failed} failed.${plain}"
     return 0

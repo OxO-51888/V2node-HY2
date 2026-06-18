@@ -22,21 +22,17 @@ func TestMasqSiteByPort(t *testing.T) {
 
 func TestMasqSiteByName(t *testing.T) {
 	tests := map[string]string{
-		"gm.5188777.xyz":                            "gm",
-		"nnm.5188777.xyz":                           "nnm",
-		"ovo.5188777.xyz":                           "ovo",
-		"yiyuan.5188777.xyz":                        "yiyuan",
-		"clash.5188777.xyz":                         "clash",
-		"pianyi.5188777.xyz":                        "pianyi",
-		"xn--54qr1i.xn--oor32f63hs9js55d.com":       "gm",
-		"xn--i2r10aa.xn--oor32f63hs9js55d.com":      "nnm",
-		"xn--4gq62f52gdss.xn--oor32f63hs9js55d.com": "yiyuan",
-		"xn--wtq35pfyd55o.xn--oor32f63hs9js55d.com": "pianyi",
-		"51801.5188777.xyz":                         "gm",
-		"51806.5188777.xyz":                         "pianyi",
-		"unknown.5188777.xyz":                       "",
-		"clash.5188777.xyz.":                        "clash",
-		"  ovo.5188777.xyz  ":                       "ovo",
+		"gm.example.com":      "gm",
+		"nnm.example.com":     "nnm",
+		"ovo.example.com":     "ovo",
+		"yiyuan.example.com":  "yiyuan",
+		"clash.example.com":   "clash",
+		"pianyi.example.com":  "pianyi",
+		"51801.example.com":   "gm",
+		"51806.example.com":   "pianyi",
+		"unknown.example.com": "",
+		"clash.example.com.":  "clash",
+		"  ovo.example.com  ": "ovo",
 	}
 
 	for name, want := range tests {
