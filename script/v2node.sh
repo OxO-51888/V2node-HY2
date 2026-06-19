@@ -324,23 +324,26 @@ apply_v2node_network_tuning() {
     local sysctl_file="/etc/sysctl.d/99-v2node-speed.conf"
     mkdir -p /etc/sysctl.d
     cat > "$sysctl_file" <<'EOF'
-# V2node speed tuning. Managed by V2node script.
-net.core.default_qdisc = fq
-net.core.netdev_max_backlog = 125000
+# V2node speed tuning based on the NNC tools.sh tcp_tune profile.
+fs.file-max = 1000000
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_ecn = 0
+net.ipv4.tcp_frto = 0
+net.ipv4.tcp_mtu_probing = 0
+net.ipv4.tcp_rfc1337 = 0
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fack = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
-net.core.rmem_default = 4194304
-net.core.wmem_default = 4194304
-net.core.optmem_max = 65536
-net.core.rps_sock_flow_entries = 16384
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 16384 33554432
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
-net.ipv4.ip_local_port_range = 10000 65000
-net.netfilter.nf_conntrack_max = 524288
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 EOF
 
     touch /etc/sysctl.conf
@@ -392,6 +395,27 @@ ip link set dev "$iface" txqueuelen 3000 2>/dev/null || true
 EOF
     chmod +x /usr/local/sbin/v2node-net-queues.sh
     /usr/local/sbin/v2node-net-queues.sh >/dev/null 2>&1 || true
+
+    mkdir -p /etc/security/limits.d
+    cat > /etc/security/limits.d/99-v2node-limits.conf <<'EOF'
+root soft nofile 1000000
+root hard nofile 1000000
+root soft nproc 1000000
+root hard nproc 1000000
+root soft core 1000000
+root hard core 1000000
+root soft memlock unlimited
+root hard memlock unlimited
+* soft nofile 1000000
+* hard nofile 1000000
+* soft nproc 1000000
+* hard nproc 1000000
+* soft core 1000000
+* hard core 1000000
+* soft memlock unlimited
+* hard memlock unlimited
+EOF
+    ulimit -SHn 1000000 >/dev/null 2>&1 || true
 
     if command -v systemctl >/dev/null 2>&1; then
         cat > /etc/systemd/system/v2node-net-queues.service <<'EOF'
