@@ -522,8 +522,8 @@ install_v2node() {
 
     if  [[ -z "$version_param" ]] ; then
         if [[ "$arch" == "64" ]]; then
-            last_version="officialhy2"
-            url="https://github.com/OxO-51888/V2node-HY2/releases/latest/download/v2node-linux-64.zip"
+            last_version="latest"
+            url="https://github.com/OxO-51888/V2node-HY2/releases/download/latest/v2node-linux-64.zip"
             sha_url="${url}.sha256"
             echo -e "${green}安装自用版：v2node official-hy2，开始下载...${plain}"
             curl -fLs "$url" | pv -s 32M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
@@ -540,11 +540,7 @@ install_v2node() {
                 }
             fi
         else
-            last_version=$(curl -Ls "https://api.github.com/repos/OxO-51888/V2node-HY2/releases/latest" | grep '"tag_name":' | cut -d '"' -f 4)
-            if [[ ! -n "$last_version" ]]; then
-                echo -e "${red}检测 v2node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 v2node 版本安装${plain}"
-                exit 1
-            fi
+            last_version="latest"
             echo -e "${yellow}当前架构 ${arch} 暂无自用 official-hy2 包，回退安装官方版本：${last_version}${plain}"
             url="https://github.com/OxO-51888/V2node-HY2/releases/download/${last_version}/v2node-linux-${arch}.zip"
             curl -fLs "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip

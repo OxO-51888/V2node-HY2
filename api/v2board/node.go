@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +19,8 @@ const (
 	Tls     = 1
 	Reality = 2
 )
+
+const defaultNodeInterval = 60 * time.Second
 
 type NodeInfo struct {
 	Id           int
@@ -196,27 +197,56 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		}
 	}
 
+	if cm.BaseConfig == nil {
+		cm.BaseConfig = &BaseConfig{}
+	}
+
 	// set interval
-	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval)
-	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval)
+	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval, defaultNodeInterval)
+	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval, defaultNodeInterval)
 
 	node.Common = cm
 
 	return node, nil
 }
 
-func intervalToTime(i interface{}) time.Duration {
-	switch reflect.TypeOf(i).Kind() {
-	case reflect.Int:
-		return time.Duration(i.(int)) * time.Second
-	case reflect.String:
-		i, _ := strconv.Atoi(i.(string))
-		return time.Duration(i) * time.Second
-	case reflect.Float64:
-		return time.Duration(i.(float64)) * time.Second
-	default:
-		return time.Duration(reflect.ValueOf(i).Int()) * time.Second
+func intervalToTime(i interface{}, fallback time.Duration) time.Duration {
+	var seconds int
+	switch v := i.(type) {
+	case int:
+		seconds = v
+	case int8:
+		seconds = int(v)
+	case int16:
+		seconds = int(v)
+	case int32:
+		seconds = int(v)
+	case int64:
+		seconds = int(v)
+	case uint:
+		seconds = int(v)
+	case uint8:
+		seconds = int(v)
+	case uint16:
+		seconds = int(v)
+	case uint32:
+		seconds = int(v)
+	case uint64:
+		seconds = int(v)
+	case float32:
+		seconds = int(v)
+	case float64:
+		seconds = int(v)
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			seconds = n
+		}
 	}
+	if seconds <= 0 {
+		return fallback
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (t TlsSettings) EffectiveServerNames() []string {

@@ -9,6 +9,7 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "script/**"
       - ".github/workflows/release.yml"
   pull_request:
     types: [opened, synchronize, reopened]
@@ -16,6 +17,7 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "script/**"
       - ".github/workflows/release.yml"
   release:
     types: [published]
@@ -182,4 +184,14 @@ jobs:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
           tag: ${{ github.ref }}
+          file_glob: true
+      - name: Upload binaries to rolling latest release
+        uses: svenstaro/upload-release-action@v2
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
+          tag: latest
+          release_name: Latest
+          overwrite: true
           file_glob: true

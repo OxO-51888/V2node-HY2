@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
@@ -57,7 +56,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 		return fmt.Errorf("get user list error: %s", err)
 	}
 	if len(c.userList) == 0 {
-		return errors.New("add users error: not have any user")
+		log.WithField("tag", node.Tag).Warn("No users returned from panel, start node with empty user list")
 	}
 	c.aliveMap, err = c.apiClient.GetUserAlive(context.Background())
 	if err != nil {
