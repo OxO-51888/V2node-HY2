@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,14 +12,18 @@ import (
 )
 
 type Task struct {
-	Name      string
-	Interval  time.Duration
-	Execute   func(context.Context) error
-	Access    sync.RWMutex
-	Running   bool
-	ReloadCh  chan struct{}
-	Stop      chan struct{}
-	Executing atomic.Bool
+	Name            string
+	Interval        time.Duration
+	Execute         func(context.Context) error
+	Access          sync.RWMutex
+	ExecuteLock     sync.Mutex
+	Running         bool
+	ReloadCh        chan struct{}
+	ReloadOnTimeout bool
+	ExitOnTimeout   bool
+	Timeout         time.Duration
+	Stop            chan struct{}
+	timeoutCount    atomic.Int32
 }
 
 func (t *Task) Start(first bool) error {
@@ -31,62 +36,86 @@ func (t *Task) Start(first bool) error {
 	t.Stop = make(chan struct{})
 	t.Access.Unlock()
 	go func() {
-		timer := time.NewTimer(t.Interval)
-		defer timer.Stop()
-		consecutiveErrors := 0
 		if first {
 			if err := t.ExecuteWithTimeout(); err != nil {
-				consecutiveErrors++
-				log.Errorf("Task %s execution error: %v", t.Name, err)
+				return
 			}
 		}
 
+		timer := time.NewTimer(t.currentInterval())
+		defer timer.Stop()
 		for {
-			timer.Reset(t.Interval)
 			select {
 			case <-timer.C:
-				// continue
 			case <-t.Stop:
 				return
 			}
 
 			if err := t.ExecuteWithTimeout(); err != nil {
-				consecutiveErrors++
 				log.Errorf("Task %s execution error: %v", t.Name, err)
-				if consecutiveErrors >= 3 {
-					log.Errorf("Task %s failed %d times, requesting reload", t.Name, consecutiveErrors)
-					t.requestReload()
-					consecutiveErrors = 0
-				}
-				continue
+				return
 			}
-			consecutiveErrors = 0
+			timer.Reset(t.currentInterval())
 		}
 	}()
 
 	return nil
 }
 
+func (t *Task) currentInterval() time.Duration {
+	t.Access.RLock()
+	defer t.Access.RUnlock()
+	return t.Interval
+}
+
+func (t *Task) UpdateInterval(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	t.Access.Lock()
+	oldInterval := t.Interval
+	t.Interval = interval
+	t.Access.Unlock()
+	if oldInterval != interval {
+		log.Infof("Task %s interval updated from %s to %s", t.Name, oldInterval, interval)
+	}
+}
+
 func (t *Task) ExecuteWithTimeout() error {
-	if !t.Executing.CompareAndSwap(false, true) {
-		log.Warningf("Task %s previous execution is still running, skip this tick", t.Name)
+	if !t.ExecuteLock.TryLock() {
+		log.Warningf("Task %s previous execution still running, skip this interval", t.Name)
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), min(5*t.Interval, 5*time.Minute))
+	ctx, cancel := context.WithTimeout(context.Background(), t.currentTimeout())
 	defer cancel()
 	done := make(chan error, 1)
 
 	go func() {
-		defer t.Executing.Store(false)
+		defer t.ExecuteLock.Unlock()
 		done <- t.Execute(ctx)
 	}()
 
 	select {
 	case <-ctx.Done():
-		log.Errorf("Task %s execution timed out, reloading", t.Name)
-		t.requestReload()
+		count := t.timeoutCount.Add(1)
+		if t.ReloadOnTimeout && t.ReloadCh != nil {
+			log.Errorf("Task %s execution timed out, reloading", t.Name)
+			select {
+			case t.ReloadCh <- struct{}{}:
+			default:
+			}
+		} else if t.ExitOnTimeout {
+			log.Errorf("Task %s execution timed out %d consecutive time(s), exiting for systemd restart", t.Name, count)
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				os.Exit(1)
+			}()
+		} else {
+			log.Errorf("Task %s execution timed out, will retry on next interval", t.Name)
+		}
 		return nil
 	case err := <-done:
+		t.timeoutCount.Store(0)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
@@ -94,15 +123,15 @@ func (t *Task) ExecuteWithTimeout() error {
 	}
 }
 
-func (t *Task) requestReload() {
-	if t.ReloadCh == nil {
-		log.Error("Reload failed: reload channel is empty")
-		return
+func (t *Task) currentTimeout() time.Duration {
+	t.Access.RLock()
+	timeout := t.Timeout
+	interval := t.Interval
+	t.Access.RUnlock()
+	if timeout > 0 {
+		return timeout
 	}
-	select {
-	case t.ReloadCh <- struct{}{}:
-	default:
-	}
+	return min(5*interval, 5*time.Minute)
 }
 
 func (t *Task) safeStop() {

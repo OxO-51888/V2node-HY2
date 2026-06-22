@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
 	log "github.com/sirupsen/logrus"
@@ -16,14 +15,16 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
-	err = c.apiClient.ReportUserTraffic(ctx, userTraffic)
+	stepCtx, cancel := panelRequestContext(ctx)
+	err = c.apiClient.ReportUserTraffic(stepCtx, userTraffic)
+	cancel()
 	if err != nil {
 		log.WithFields(log.Fields{
 			"tag": c.tag,
 			"err": err,
 		}).Info("Report user traffic failed")
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+		if isPanelTimeout(err) {
+			return nil
 		}
 	} else {
 		if len(userTraffic) > 0 {
@@ -33,6 +34,11 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		} else {
 			log.WithField("tag", c.tag).Debug("Report empty traffic heartbeat")
 		}
+	}
+
+	if !hasPanelTaskBudget(ctx) {
+		log.WithField("tag", c.tag).Warn("Skip online device report because panel task budget is low")
+		return nil
 	}
 
 	if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
@@ -63,14 +69,20 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			// json structure: { UID1:["ip1","ip2"],UID2:["ip3","ip4"] }
 			data[onlineuser.UID] = append(data[onlineuser.UID], onlineuser.IP)
 		}
-		err := c.apiClient.ReportNodeOnlineUsers(ctx, &data)
+		if !hasPanelTaskBudget(ctx) {
+			log.WithField("tag", c.tag).Warn("Skip online users report because panel task budget is low")
+			return nil
+		}
+		stepCtx, cancel := panelRequestContext(ctx)
+		err := c.apiClient.ReportNodeOnlineUsers(stepCtx, &data)
+		cancel()
 		if err != nil {
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
 			}).Info("Report online users failed")
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
+			if isPanelTimeout(err) {
+				return nil
 			}
 		}
 		log.WithField("tag", c.tag).Infof("Total %d online users, %d Reported", totalOnline, len(result))

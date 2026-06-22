@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
 	"github.com/OxO-51888/V2node-HY2/common/task"
@@ -24,6 +26,8 @@ type Controller struct {
 	nodeInfoMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
+	reloadAccess            sync.Mutex
+	lastReloadAt            time.Time
 }
 
 // NewController return a Node controller with default parameters.
