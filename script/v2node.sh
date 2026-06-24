@@ -318,145 +318,6 @@ update_shell() {
     fi
 }
 
-apply_v2node_network_tuning() {
-    echo -e "${green}Applying V2node network tuning...${plain}"
-
-    local sysctl_file="/etc/sysctl.d/99-v2node-speed.conf"
-    mkdir -p /etc/sysctl.d
-    cat > "$sysctl_file" <<'EOF'
-# V2node speed tuning based on the NNC tools.sh tcp_tune profile.
-fs.file-max = 1000000
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_ecn = 0
-net.ipv4.tcp_frto = 0
-net.ipv4.tcp_mtu_probing = 0
-net.ipv4.tcp_rfc1337 = 0
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_adv_win_scale = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 16384 67108864
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-
-    touch /etc/sysctl.conf
-    sed -i '/^# BEGIN V2node speed tuning$/,/^# END V2node speed tuning$/d' /etc/sysctl.conf
-    {
-        echo ""
-        echo "# BEGIN V2node speed tuning"
-        cat "$sysctl_file"
-        echo "# END V2node speed tuning"
-    } >> /etc/sysctl.conf
-
-    sysctl -p "$sysctl_file" >/dev/null 2>&1 || true
-    while IFS= read -r line; do
-        case "$line" in
-            ""|\#*) continue ;;
-        esac
-        sysctl -w "$line" >/dev/null 2>&1 || true
-    done < "$sysctl_file"
-
-    mkdir -p /usr/local/sbin
-    cat > /usr/local/sbin/v2node-net-queues.sh <<'EOF'
-#!/bin/sh
-set -eu
-
-iface="${1:-$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')}"
-[ -n "$iface" ] || exit 0
-[ -d "/sys/class/net/$iface" ] || exit 0
-
-cpu_count="$(nproc 2>/dev/null || echo 1)"
-case "$cpu_count" in
-    ''|*[!0-9]*) cpu_count=1 ;;
-esac
-
-if [ "$cpu_count" -ge 32 ]; then
-    mask="ffffffff"
-else
-    mask="$(printf '%x' "$(( (1 << cpu_count) - 1 ))")"
-fi
-
-echo 16384 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-
-for queue in /sys/class/net/"$iface"/queues/rx-*; do
-    [ -d "$queue" ] || continue
-    echo "$mask" > "$queue/rps_cpus" 2>/dev/null || true
-    echo 4096 > "$queue/rps_flow_cnt" 2>/dev/null || true
-done
-
-ip link set dev "$iface" txqueuelen 3000 2>/dev/null || true
-EOF
-    chmod +x /usr/local/sbin/v2node-net-queues.sh
-    /usr/local/sbin/v2node-net-queues.sh >/dev/null 2>&1 || true
-
-    mkdir -p /etc/security/limits.d
-    cat > /etc/security/limits.d/99-v2node-limits.conf <<'EOF'
-root soft nofile 1000000
-root hard nofile 1000000
-root soft nproc 1000000
-root hard nproc 1000000
-root soft core 1000000
-root hard core 1000000
-root soft memlock unlimited
-root hard memlock unlimited
-* soft nofile 1000000
-* hard nofile 1000000
-* soft nproc 1000000
-* hard nproc 1000000
-* soft core 1000000
-* hard core 1000000
-* soft memlock unlimited
-* hard memlock unlimited
-EOF
-    ulimit -SHn 1000000 >/dev/null 2>&1 || true
-
-    if command -v systemctl >/dev/null 2>&1; then
-        cat > /etc/systemd/system/v2node-net-queues.service <<'EOF'
-[Unit]
-Description=V2node network queue tuning
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/v2node-net-queues.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable --now v2node-net-queues.service >/dev/null 2>&1 || true
-    fi
-
-    if ! command -v irqbalance >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then
-            DEBIAN_FRONTEND=noninteractive apt-get install -y irqbalance >/dev/null 2>&1 || true
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y irqbalance >/dev/null 2>&1 || true
-        elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache irqbalance >/dev/null 2>&1 || true
-        elif command -v pacman >/dev/null 2>&1; then
-            pacman -S --noconfirm --needed irqbalance >/dev/null 2>&1 || true
-        fi
-    fi
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable --now irqbalance >/dev/null 2>&1 || true
-    elif command -v rc-update >/dev/null 2>&1; then
-        rc-update add irqbalance default >/dev/null 2>&1 || true
-        service irqbalance start >/dev/null 2>&1 || true
-    fi
-
-    echo -e "${green}V2node network tuning applied.${plain}"
-}
-
 apply_v2node_port_hopping() {
     echo -e "${green}Applying V2node HY2 port hopping...${plain}"
 
@@ -529,13 +390,6 @@ EOF
 
     /usr/local/sbin/v2node-hy2-porthop.sh >/dev/null 2>&1 || true
     echo -e "${green}V2node HY2 port hopping applied.${plain}"
-}
-
-tune() {
-    apply_v2node_network_tuning
-    if [[ $# == 0 ]]; then
-        before_show_menu
-    fi
 }
 
 porthop() {
@@ -730,7 +584,6 @@ show_usage() {
     echo "v2node log          - 查看 v2node 日志"
     echo "v2node x25519       - 生成 x25519 密钥"
     echo "v2node generate     - 生成 v2node 配置文件"
-    echo "v2node tune         - 套用 V2node 网络优化"
     echo "v2node update       - 更新 v2node"
     echo "v2node update x.x.x - 安装 v2node 指定版本"
     echo "v2node install      - 安装 v2node"
@@ -762,12 +615,11 @@ show_menu() {
   ${green}12.${plain} 升级 v2node 维护脚本
   ${green}13.${plain} 生成 v2node 配置文件
   ${green}14.${plain} 放行 VPS 的所有网络端口
-  ${green}15.${plain} 套用 V2node 网络优化
-  ${green}16.${plain} 退出脚本
+  ${green}15.${plain} 退出脚本
  "
  #后续更新可加入上方字符串中
     show_status
-    echo && read -rp "请输入选择 [0-16]: " num
+    echo && read -rp "请输入选择 [0-15]: " num
 
     case "${num}" in
         0) config ;;
@@ -785,9 +637,8 @@ show_menu() {
         12) update_shell ;;
         13) generate_config_file ;;
         14) open_ports ;;
-        15) check_install && tune ;;
-        16) exit ;;
-        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" ;;
+        15) exit ;;
+        *) echo -e "${red}请输入正确的数字 [0-15]${plain}" ;;
     esac
 }
 
@@ -804,7 +655,6 @@ if [[ $# > 0 ]]; then
         "update") check_install 0 && update 0 $2 ;;
         "config") config $* ;;
         "generate") generate_config_file ;;
-        "tune") check_install 0 && tune 0 ;;
         "porthop") check_install 0 && porthop 0 ;;
         "install") check_uninstall 0 && install 0 ;;
         "uninstall") check_install 0 && uninstall 0 ;;
