@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -132,7 +133,14 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}
-	hash := sha256.Sum256(r.Body())
+	body := r.Body()
+	if len(bytes.TrimSpace(body)) == 0 {
+		if c.responseBodyHash != "" || c.nodeEtag != "" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("empty node params response, status code: %d", r.StatusCode())
+	}
+	hash := sha256.Sum256(body)
 	newBodyHash := hex.EncodeToString(hash[:])
 	if c.responseBodyHash == newBodyHash {
 		return nil, nil
@@ -154,7 +162,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	}
 	// parse protocol params
 	cm := &CommonNode{}
-	err = json.Unmarshal(r.Body(), cm)
+	err = json.Unmarshal(body, cm)
 	if err != nil {
 		return nil, fmt.Errorf("decode node params error: %s", err)
 	}
