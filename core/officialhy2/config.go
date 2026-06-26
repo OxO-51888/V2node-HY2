@@ -81,7 +81,10 @@ func (n *Node) buildConfig(info *panel.NodeInfo) (*server.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	outbound := n.getOutboundConfig()
+	outbound, err := n.getOutboundConfig()
+	if err != nil {
+		return nil, err
+	}
 	masqHandler := n.getMasqHandler()
 
 	return &server.Config{
@@ -266,10 +269,138 @@ func (n *Node) getBandwidthConfig(info *panel.NodeInfo) *server.BandwidthConfig 
 	return bandwidth
 }
 
-func (n *Node) getOutboundConfig() server.Outbound {
-	return &outbounds.PluggableOutboundAdapter{
-		PluggableOutbound: outbounds.NewDirectOutboundSimple(outbounds.DirectOutboundModeAuto),
+func (n *Node) getOutboundConfig() (server.Outbound, error) {
+	direct := outbounds.NewDirectOutboundSimple(outbounds.DirectOutboundModeAuto)
+	pluggable := direct
+
+	if n.unlock != nil && n.unlock.Enable && len(n.unlock.SOCKS) > 0 {
+		unlockOutbound, entries := n.getUnlockOutbounds(direct)
+		if unlockOutbound != "" {
+			rules := n.getUnlockRules(unlockOutbound)
+			if rules != "" {
+				aclOutbound, err := outbounds.NewACLEngineFromString(rules, entries, nil)
+				if err != nil {
+					return nil, fmt.Errorf("build unlock acl: %w", err)
+				}
+				pluggable = aclOutbound
+			}
+		}
 	}
+
+	return &outbounds.PluggableOutboundAdapter{
+		PluggableOutbound: pluggable,
+	}, nil
+}
+
+func (n *Node) getUnlockOutbounds(direct outbounds.PluggableOutbound) (string, []outbounds.OutboundEntry) {
+	entries := []outbounds.OutboundEntry{
+		{Name: "direct", Outbound: direct},
+		{Name: "default", Outbound: direct},
+	}
+	targetTag := strings.ToLower(strings.TrimSpace(n.unlock.DefaultOutbound))
+	firstTag := ""
+	for _, item := range n.unlock.SOCKS {
+		tag := strings.ToLower(strings.TrimSpace(item.Tag))
+		if tag == "" || item.Address == "" || item.Port <= 0 {
+			continue
+		}
+		if firstTag == "" {
+			firstTag = tag
+		}
+		entries = append(entries, outbounds.OutboundEntry{
+			Name: tag,
+			Outbound: outbounds.NewSOCKS5Outbound(
+				formatAddress(item.Address, item.Port),
+				item.Username,
+				item.Password,
+			),
+		})
+	}
+	if firstTag == "" {
+		return "", entries
+	}
+	if targetTag == "" {
+		targetTag = firstTag
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name, targetTag) && targetTag != "direct" && targetTag != "default" {
+			return targetTag, entries
+		}
+	}
+	return firstTag, entries
+}
+
+func (n *Node) getUnlockRules(defaultOutbound string) string {
+	var lines []string
+	if len(n.unlock.RuleSets) > 0 {
+		for tag, rules := range n.unlock.RuleSets {
+			outbound := strings.ToLower(strings.TrimSpace(tag))
+			if outbound == "" {
+				outbound = defaultOutbound
+			}
+			for _, rule := range rules {
+				if line := aclRuleLine(outbound, rule); line != "" {
+					lines = append(lines, line)
+				}
+			}
+		}
+	}
+	for _, rule := range n.unlock.Rules {
+		if line := aclRuleLine(defaultOutbound, rule); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		for _, domain := range defaultUnlockDomains {
+			if line := aclRuleLine(defaultOutbound, domain); line != "" {
+				lines = append(lines, line)
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func aclRuleLine(outbound, value string) string {
+	outbound = strings.ToLower(strings.TrimSpace(outbound))
+	value = strings.TrimSpace(value)
+	if outbound == "" || value == "" {
+		return ""
+	}
+	if strings.Contains(value, "(") && strings.HasSuffix(value, ")") {
+		return value
+	}
+	addr := value
+	if !strings.Contains(addr, ":") && !strings.Contains(addr, "/") && net.ParseIP(addr) == nil {
+		addr = "suffix:" + strings.TrimPrefix(addr, ".")
+	}
+	return fmt.Sprintf("%s(%s)", outbound, addr)
+}
+
+var defaultUnlockDomains = []string{
+	"netflix.com",
+	"netflix.net",
+	"nflxext.com",
+	"nflximg.net",
+	"nflxso.net",
+	"nflxvideo.net",
+	"disneyplus.com",
+	"disney-plus.net",
+	"dssott.com",
+	"bamgrid.com",
+	"max.com",
+	"hbomax.com",
+	"hbomaxcdn.com",
+	"hulu.com",
+	"huluim.com",
+	"primevideo.com",
+	"amazonvideo.com",
+	"media-amazon.com",
+	"tv.apple.com",
+	"itunes.apple.com",
+	"twitter.com",
+	"x.com",
+	"t.co",
+	"twimg.com",
 }
 
 func (n *Node) getMasqHandler() http.Handler {

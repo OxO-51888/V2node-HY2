@@ -10,6 +10,7 @@ import (
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
 	"github.com/OxO-51888/V2node-HY2/common/counter"
 	"github.com/OxO-51888/V2node-HY2/common/format"
+	"github.com/OxO-51888/V2node-HY2/conf"
 	"github.com/apernet/hysteria/core/v2/server"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/zap"
@@ -18,6 +19,7 @@ import (
 type Manager struct {
 	nodes  map[string]*Node
 	logger *zap.Logger
+	unlock *conf.UnlockConfig
 	mu     sync.RWMutex
 }
 
@@ -28,6 +30,7 @@ type Node struct {
 	auth      *Authenticator
 	events    *eventLogger
 	traffic   *trafficLogger
+	unlock    *conf.UnlockConfig
 	serverMu  sync.Mutex
 	stopCh    chan struct{}
 	serveDone chan struct{}
@@ -39,7 +42,7 @@ type Authenticator struct {
 	mu    sync.RWMutex
 }
 
-func New() (*Manager, error) {
+func New(unlock *conf.UnlockConfig) (*Manager, error) {
 	logger, err := newLogger("error")
 	if err != nil {
 		return nil, err
@@ -47,6 +50,7 @@ func New() (*Manager, error) {
 	return &Manager{
 		nodes:  make(map[string]*Node),
 		logger: logger,
+		unlock: unlock,
 	}, nil
 }
 
@@ -75,8 +79,9 @@ func (m *Manager) AddNode(tag string, info *panel.NodeInfo) error {
 	}
 
 	n := &Node{
-		tag:  tag,
-		auth: &Authenticator{users: make(map[string]int)},
+		tag:    tag,
+		auth:   &Authenticator{users: make(map[string]int)},
+		unlock: m.unlock,
 		events: &eventLogger{
 			tag:                  tag,
 			logger:               m.logger,

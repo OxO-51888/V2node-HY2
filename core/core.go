@@ -29,7 +29,7 @@ type UserMap struct {
 }
 
 func New(config *conf.Conf) *V2Core {
-	hy2, err := officialhy2.New()
+	hy2, err := officialhy2.New(&config.Unlock)
 	if err != nil {
 		log.WithField("err", err).Panic("failed to initialize official hysteria2 core")
 	}

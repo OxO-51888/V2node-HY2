@@ -270,6 +270,95 @@ EOF
     echo -e "${green}V2node HY2 port hopping applied.${plain}"
 }
 
+apply_v2node_egress_guard() {
+    echo -e "${green}Applying V2node egress guard...${plain}"
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y iptables >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y iptables >/dev/null 2>&1 || true
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache iptables >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -S --noconfirm --needed iptables >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo -e "${yellow}iptables not found, skip V2node egress guard.${plain}"
+        return 0
+    fi
+
+    mkdir -p /usr/local/sbin
+    cat > /usr/local/sbin/v2node-egress-guard.sh <<'EOF'
+#!/bin/sh
+set -eu
+
+CHAIN="V2NODE_EGRESS_GUARD"
+
+iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
+while iptables -C OUTPUT -j "$CHAIN" 2>/dev/null; do
+    iptables -D OUTPUT -j "$CHAIN" 2>/dev/null || break
+done
+iptables -I OUTPUT 1 -j "$CHAIN"
+
+# BitTorrent common ports and signatures.
+iptables -A "$CHAIN" -p tcp -m multiport --dports 6881:6889,6969,2710,51413,16881,8999 -j REJECT --reject-with tcp-reset
+iptables -A "$CHAIN" -p udp -m multiport --dports 6881:6889,6969,2710,51413,16881,8999 -j DROP
+
+# Mining pool ports.
+iptables -A "$CHAIN" -p tcp -m multiport --dports 3333,3334,3335,4444,5555,7777,9999,14433,14444,18081,18082 -j REJECT --reject-with tcp-reset
+
+add_tcp_string() {
+    iptables -A "$CHAIN" -p tcp -m string --string "$1" --algo bm --to 65535 -j REJECT --reject-with tcp-reset 2>/dev/null || \
+    iptables -A "$CHAIN" -p tcp -m string --string "$1" --algo bm -j REJECT --reject-with tcp-reset 2>/dev/null || true
+}
+
+add_udp_string() {
+    iptables -A "$CHAIN" -p udp -m string --string "$1" --algo bm --to 65535 -j DROP 2>/dev/null || \
+    iptables -A "$CHAIN" -p udp -m string --string "$1" --algo bm -j DROP 2>/dev/null || true
+}
+
+for pattern in \
+    "BitTorrent protocol" "BitTorrent" "magnet:?xt=urn:btih" "peer_id=" ".torrent" "announce" "info_hash" \
+    "uTorrent" "Transmission" "Azureus" \
+    "stratum+tcp" "mining.subscribe" "mining.authorize" "eth_submitLogin" "eth_submitWork" \
+    "falundafa.org" "minghui.org" "epochtimes.com" "ntdtv.com" "aboluowang.com" "secretchina.com"; do
+    add_tcp_string "$pattern"
+    add_udp_string "$pattern"
+done
+EOF
+    chmod +x /usr/local/sbin/v2node-egress-guard.sh
+
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > /etc/systemd/system/v2node-egress-guard.service <<'EOF'
+[Unit]
+Description=V2node egress guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/v2node-egress-guard.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now v2node-egress-guard.service >/dev/null 2>&1 || true
+    else
+        /usr/local/sbin/v2node-egress-guard.sh >/dev/null 2>&1 || true
+        if command -v crontab >/dev/null 2>&1; then
+            (crontab -l 2>/dev/null | grep -v '/usr/local/sbin/v2node-egress-guard.sh' || true; echo '@reboot /usr/local/sbin/v2node-egress-guard.sh >/dev/null 2>&1') | crontab -
+        fi
+    fi
+
+    /usr/local/sbin/v2node-egress-guard.sh >/dev/null 2>&1 || true
+    echo -e "${green}V2node egress guard applied.${plain}"
+}
+
 sync_v2node_masq_pages() {
     local masq_root="/etc/v2node/masq"
     mkdir -p "$masq_root"
@@ -482,6 +571,7 @@ EOF
     fi
 
     apply_v2node_port_hopping
+    apply_v2node_egress_guard
 
     if [[ ! -f /etc/v2node/config.json ]]; then
         # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互

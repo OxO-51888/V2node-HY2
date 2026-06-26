@@ -13,6 +13,7 @@ const DefaultNodeTimeout = 15
 type Conf struct {
 	LogConfig   LogConfig    `mapstructure:"Log"`
 	NodeConfigs []NodeConfig `mapstructure:"Nodes"`
+	Unlock      UnlockConfig `mapstructure:"Unlock"`
 	PprofPort   int          `mapstructure:"PprofPort"`
 }
 
@@ -28,6 +29,22 @@ type NodeConfig struct {
 	Key        string `mapstructure:"ApiKey"`
 	Timeout    int    `mapstructure:"Timeout"`
 	RetryCount *int   `mapstructure:"RetryCount"`
+}
+
+type UnlockConfig struct {
+	Enable          bool                `mapstructure:"Enable"`
+	DefaultOutbound string              `mapstructure:"DefaultOutbound"`
+	SOCKS           []SOCKSConfig       `mapstructure:"SOCKS"`
+	Rules           []string            `mapstructure:"Rules"`
+	RuleSets        map[string][]string `mapstructure:"RuleSets"`
+}
+
+type SOCKSConfig struct {
+	Tag      string `mapstructure:"Tag"`
+	Address  string `mapstructure:"Address"`
+	Port     int    `mapstructure:"Port"`
+	Username string `mapstructure:"Username"`
+	Password string `mapstructure:"Password"`
 }
 
 func New() *Conf {
