@@ -51,7 +51,15 @@ func TestUnlockRulesUseDefaultOutbound(t *testing.T) {
 		}},
 	}}
 	rules := n.getUnlockRules("sg")
-	for _, want := range []string{"sg(suffix:netflix.com)", "sg(suffix:x.com)", "sg(suffix:twitter.com)"} {
+	for _, want := range []string{
+		"sg(suffix:netflix.com)",
+		"sg(suffix:chatgpt.com)",
+		"sg(suffix:api.openai.com)",
+		"sg(suffix:oaistatic.com)",
+		"sg(suffix:oaiusercontent.com)",
+		"sg(suffix:x.com)",
+		"sg(suffix:twitter.com)",
+	} {
 		if !strings.Contains(rules, want) {
 			t.Fatalf("unlock rules missing %q in:\n%s", want, rules)
 		}
