@@ -57,11 +57,19 @@ func TestUnlockRulesUseDefaultOutbound(t *testing.T) {
 		"sg(suffix:api.openai.com)",
 		"sg(suffix:oaistatic.com)",
 		"sg(suffix:oaiusercontent.com)",
-		"sg(suffix:x.com)",
-		"sg(suffix:twitter.com)",
 	} {
 		if !strings.Contains(rules, want) {
 			t.Fatalf("unlock rules missing %q in:\n%s", want, rules)
+		}
+	}
+	for _, unwanted := range []string{
+		"sg(suffix:x.com)",
+		"sg(suffix:twitter.com)",
+		"sg(suffix:t.co)",
+		"sg(suffix:twimg.com)",
+	} {
+		if strings.Contains(rules, unwanted) {
+			t.Fatalf("unlock rules should not include %q in:\n%s", unwanted, rules)
 		}
 	}
 }

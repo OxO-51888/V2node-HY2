@@ -407,10 +407,6 @@ var defaultUnlockDomains = []string{
 	"oaistatic.com",
 	"oaiusercontent.com",
 	"cdn.openai.com",
-	"twitter.com",
-	"x.com",
-	"t.co",
-	"twimg.com",
 }
 
 func (n *Node) getMasqHandler() http.Handler {
