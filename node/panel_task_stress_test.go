@@ -16,6 +16,7 @@ func TestPanelTaskStress(t *testing.T) {
 
 	rounds := stressEnvInt("V2NODE_STRESS_ROUNDS", 10)
 	attempts := stressEnvInt("V2NODE_STRESS_ATTEMPTS", 1000000)
+	sites := []string{"gm", "nnm", "ovo", "yiyuan", "clash", "pianyi"}
 	base := &panel.NodeInfo{
 		Id:           1,
 		Type:         "hysteria2",
@@ -38,39 +39,45 @@ func TestPanelTaskStress(t *testing.T) {
 		},
 	}
 
-	start := time.Now()
-	total := 0
-	for round := 0; round < rounds; round++ {
-		intervalOnly := *base
-		intervalOnly.PullInterval = base.PullInterval + time.Duration(round+1)*time.Second
-		intervalOnly.PushInterval = base.PushInterval + time.Duration(round+1)*time.Second
-		if requiresCoreReload(base, &intervalOnly) {
-			t.Fatal("interval-only node changes must not require a core reload")
-		}
+	for _, site := range sites {
+		t.Run(site, func(t *testing.T) {
+			siteBase := *base
+			siteBase.Tag = site
+			start := time.Now()
+			total := 0
+			for round := 0; round < rounds; round++ {
+				intervalOnly := siteBase
+				intervalOnly.PullInterval = siteBase.PullInterval + time.Duration(round+1)*time.Second
+				intervalOnly.PushInterval = siteBase.PushInterval + time.Duration(round+1)*time.Second
+				if requiresCoreReload(&siteBase, &intervalOnly) {
+					t.Fatal("interval-only node changes must not require a core reload")
+				}
 
-		coreChanged := *base
-		commonChanged := *base.Common
-		coreChanged.Common = &commonChanged
-		coreChanged.Common.ServerPort = base.Common.ServerPort + round + 1
-		if !requiresCoreReload(base, &coreChanged) {
-			t.Fatal("core node changes must require a core reload")
-		}
+				coreChanged := siteBase
+				commonChanged := *siteBase.Common
+				coreChanged.Common = &commonChanged
+				coreChanged.Common.ServerPort = siteBase.Common.ServerPort + round + 1
+				if !requiresCoreReload(&siteBase, &coreChanged) {
+					t.Fatal("core node changes must require a core reload")
+				}
 
-		for i := 0; i < attempts; i++ {
-			if !hasPanelTaskBudget(nilDeadlineContext{}) {
-				t.Fatal("context without a deadline should have task budget")
+				for i := 0; i < attempts; i++ {
+					if !hasPanelTaskBudget(nilDeadlineContext{}) {
+						t.Fatal("context without a deadline should have task budget")
+					}
+					if requiresCoreReload(&siteBase, &intervalOnly) {
+						t.Fatal("interval-only node changes must stay non-core under stress")
+					}
+					if !requiresCoreReload(&siteBase, &coreChanged) {
+						t.Fatal("core node changes must stay core under stress")
+					}
+					total++
+				}
+				t.Logf("%s round %d/%d passed, attempts=%d", site, round+1, rounds, attempts)
 			}
-			if requiresCoreReload(base, &intervalOnly) {
-				t.Fatal("interval-only node changes must stay non-core under stress")
-			}
-			if !requiresCoreReload(base, &coreChanged) {
-				t.Fatal("core node changes must stay core under stress")
-			}
-			total++
-		}
-		t.Logf("round %d/%d passed, attempts=%d", round+1, rounds, attempts)
+			t.Logf("%s panel task stress passed: rounds=%d attempts_per_round=%d total=%d elapsed=%s", site, rounds, attempts, total, time.Since(start))
+		})
 	}
-	t.Logf("panel task stress passed: rounds=%d attempts_per_round=%d total=%d elapsed=%s", rounds, attempts, total, time.Since(start))
 }
 
 type nilDeadlineContext struct{}
