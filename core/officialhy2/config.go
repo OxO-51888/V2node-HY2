@@ -397,16 +397,6 @@ var defaultUnlockDomains = []string{
 	"media-amazon.com",
 	"tv.apple.com",
 	"itunes.apple.com",
-	"chatgpt.com",
-	"chat.openai.com",
-	"openai.com",
-	"api.openai.com",
-	"auth.openai.com",
-	"auth0.openai.com",
-	"platform.openai.com",
-	"oaistatic.com",
-	"oaiusercontent.com",
-	"cdn.openai.com",
 }
 
 func (n *Node) getMasqHandler() http.Handler {
