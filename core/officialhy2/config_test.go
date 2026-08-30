@@ -40,6 +40,38 @@ func TestACLRuleLine(t *testing.T) {
 	}
 }
 
+func TestNormalizeListenIPSupportsDualStackWildcard(t *testing.T) {
+	tests := map[string]string{
+		"":              "",
+		"*":             "",
+		"0.0.0.0":       "",
+		"::":            "",
+		"[::]":          "",
+		"2001:db8::1":   "2001:db8::1",
+		"[2001:db8::1]": "2001:db8::1",
+		"127.0.0.1":     "127.0.0.1",
+	}
+	for input, want := range tests {
+		if got := normalizeListenIP(input); got != want {
+			t.Fatalf("normalizeListenIP(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestFormatAddressSupportsIPv6(t *testing.T) {
+	tests := map[string]string{
+		"":              ":8443",
+		"127.0.0.1":     "127.0.0.1:8443",
+		"2001:db8::1":   "[2001:db8::1]:8443",
+		"[2001:db8::1]": "[2001:db8::1]:8443",
+	}
+	for input, want := range tests {
+		if got := formatAddress(input, 8443); got != want {
+			t.Fatalf("formatAddress(%q, 8443) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestUnlockRulesUseDefaultOutbound(t *testing.T) {
 	n := &Node{unlock: &conf.UnlockConfig{
 		Enable:          true,
@@ -73,6 +105,10 @@ func TestUnlockRulesUseDefaultOutbound(t *testing.T) {
 		"sg(suffix:oaistatic.com)",
 		"sg(suffix:oaiusercontent.com)",
 		"sg(suffix:cdn.openai.com)",
+		"sg(suffix:gemini.google.com)",
+		"sg(suffix:anthropic.com)",
+		"sg(suffix:instagram.com)",
+		"sg(suffix:cdninstagram.com)",
 	} {
 		if strings.Contains(rules, unwanted) {
 			t.Fatalf("unlock rules should not include %q in:\n%s", unwanted, rules)

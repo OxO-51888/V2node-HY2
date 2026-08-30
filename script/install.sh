@@ -211,8 +211,8 @@ apply_v2node_port_hopping() {
         fi
     fi
 
-    if ! command -v iptables >/dev/null 2>&1; then
-        echo -e "${yellow}iptables not found, skip V2node HY2 port hopping.${plain}"
+    if ! command -v iptables >/dev/null 2>&1 && ! command -v ip6tables >/dev/null 2>&1; then
+        echo -e "${yellow}iptables/ip6tables not found, skip V2node HY2 port hopping.${plain}"
         return 0
     fi
 
@@ -221,24 +221,31 @@ apply_v2node_port_hopping() {
 #!/bin/sh
 set -eu
 
-CHAIN="V2NODE_HY2_HOP"
+apply_family() {
+    IPT="$1"
+    CHAIN="$2"
+    command -v "$IPT" >/dev/null 2>&1 || return 0
 
-while iptables -t nat -D PREROUTING -p udp --dport 51820:51920 -j REDIRECT --to-ports 51806 2>/dev/null; do
-    :
-done
+    while "$IPT" -t nat -D PREROUTING -p udp --dport 51820:51920 -j REDIRECT --to-ports 51806 2>/dev/null; do
+        :
+    done
 
-iptables -t nat -N "$CHAIN" 2>/dev/null || iptables -t nat -F "$CHAIN"
-while iptables -t nat -C PREROUTING -p udp -j "$CHAIN" 2>/dev/null; do
-    iptables -t nat -D PREROUTING -p udp -j "$CHAIN" 2>/dev/null || break
-done
-iptables -t nat -I PREROUTING 1 -p udp -j "$CHAIN"
+    "$IPT" -t nat -N "$CHAIN" 2>/dev/null || "$IPT" -t nat -F "$CHAIN" 2>/dev/null || return 0
+    while "$IPT" -t nat -C PREROUTING -p udp -j "$CHAIN" 2>/dev/null; do
+        "$IPT" -t nat -D PREROUTING -p udp -j "$CHAIN" 2>/dev/null || break
+    done
+    "$IPT" -t nat -I PREROUTING 1 -p udp -j "$CHAIN" 2>/dev/null || return 0
 
-iptables -t nat -A "$CHAIN" -p udp --dport 55001:60000 -m comment --comment "v2node-gm-51801" -j REDIRECT --to-ports 51801
-iptables -t nat -A "$CHAIN" -p udp --dport 50001:55000 -m comment --comment "v2node-nnm-51802" -j REDIRECT --to-ports 51802
-iptables -t nat -A "$CHAIN" -p udp --dport 45001:50000 -m comment --comment "v2node-ovo-51803" -j REDIRECT --to-ports 51803
-iptables -t nat -A "$CHAIN" -p udp --dport 40001:45000 -m comment --comment "v2node-yiyuan-51804" -j REDIRECT --to-ports 51804
-iptables -t nat -A "$CHAIN" -p udp --dport 35001:40000 -m comment --comment "v2node-clash-51805" -j REDIRECT --to-ports 51805
-iptables -t nat -A "$CHAIN" -p udp --dport 30001:35000 -m comment --comment "v2node-pianyi-51806" -j REDIRECT --to-ports 51806
+    "$IPT" -t nat -A "$CHAIN" -p udp --dport 55001:60000 -m comment --comment "v2node-gm-51801" -j REDIRECT --to-ports 51801 2>/dev/null || true
+    "$IPT" -t nat -A "$CHAIN" -p udp --dport 50001:55000 -m comment --comment "v2node-nnm-51802" -j REDIRECT --to-ports 51802 2>/dev/null || true
+    "$IPT" -t nat -A "$CHAIN" -p udp --dport 45001:50000 -m comment --comment "v2node-ovo-51803" -j REDIRECT --to-ports 51803 2>/dev/null || true
+    "$IPT" -t nat -A "$CHAIN" -p udp --dport 40001:45000 -m comment --comment "v2node-yiyuan-51804" -j REDIRECT --to-ports 51804 2>/dev/null || true
+    "$IPT" -t nat -A "$CHAIN" -p udp --dport 35001:40000 -m comment --comment "v2node-clash-51805" -j REDIRECT --to-ports 51805 2>/dev/null || true
+    "$IPT" -t nat -A "$CHAIN" -p udp --dport 30001:35000 -m comment --comment "v2node-pianyi-51806" -j REDIRECT --to-ports 51806 2>/dev/null || true
+}
+
+apply_family iptables V2NODE_HY2_HOP
+apply_family ip6tables V2NODE_HY2_HOP6
 EOF
     chmod +x /usr/local/sbin/v2node-hy2-porthop.sh
 
@@ -285,49 +292,59 @@ apply_v2node_egress_guard() {
         fi
     fi
 
-    if ! command -v iptables >/dev/null 2>&1; then
-        echo -e "${yellow}iptables not found, skip V2node egress guard.${plain}"
+    if ! command -v iptables >/dev/null 2>&1 && ! command -v ip6tables >/dev/null 2>&1; then
+        echo -e "${yellow}iptables/ip6tables not found, skip V2node egress guard.${plain}"
         return 0
     fi
 
     mkdir -p /usr/local/sbin
-    cat > /usr/local/sbin/v2node-egress-guard.sh <<'EOF'
+cat > /usr/local/sbin/v2node-egress-guard.sh <<'EOF'
 #!/bin/sh
 set -eu
 
-CHAIN="V2NODE_EGRESS_GUARD"
-
-iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
-while iptables -C OUTPUT -j "$CHAIN" 2>/dev/null; do
-    iptables -D OUTPUT -j "$CHAIN" 2>/dev/null || break
-done
-iptables -I OUTPUT 1 -j "$CHAIN"
-
-# BitTorrent common ports and signatures.
-iptables -A "$CHAIN" -p tcp -m multiport --dports 6881:6889,6969,2710,51413,16881,8999 -j REJECT --reject-with tcp-reset
-iptables -A "$CHAIN" -p udp -m multiport --dports 6881:6889,6969,2710,51413,16881,8999 -j DROP
-
-# Mining pool ports.
-iptables -A "$CHAIN" -p tcp -m multiport --dports 3333,3334,3335,4444,5555,7777,9999,14433,14444,18081,18082 -j REJECT --reject-with tcp-reset
-
 add_tcp_string() {
-    iptables -A "$CHAIN" -p tcp -m string --string "$1" --algo bm --to 65535 -j REJECT --reject-with tcp-reset 2>/dev/null || \
-    iptables -A "$CHAIN" -p tcp -m string --string "$1" --algo bm -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    IPT="$1"
+    CHAIN="$2"
+    PATTERN="$3"
+    "$IPT" -A "$CHAIN" -p tcp -m string --string "$PATTERN" --algo bm --to 65535 -j REJECT --reject-with tcp-reset 2>/dev/null || \
+    "$IPT" -A "$CHAIN" -p tcp -m string --string "$PATTERN" --algo bm -j REJECT --reject-with tcp-reset 2>/dev/null || true
 }
 
 add_udp_string() {
-    iptables -A "$CHAIN" -p udp -m string --string "$1" --algo bm --to 65535 -j DROP 2>/dev/null || \
-    iptables -A "$CHAIN" -p udp -m string --string "$1" --algo bm -j DROP 2>/dev/null || true
+    IPT="$1"
+    CHAIN="$2"
+    PATTERN="$3"
+    "$IPT" -A "$CHAIN" -p udp -m string --string "$PATTERN" --algo bm --to 65535 -j DROP 2>/dev/null || \
+    "$IPT" -A "$CHAIN" -p udp -m string --string "$PATTERN" --algo bm -j DROP 2>/dev/null || true
 }
 
-for pattern in \
-    "BitTorrent protocol" "BitTorrent" "magnet:?xt=urn:btih" "peer_id=" ".torrent" "announce" "info_hash" \
-    "uTorrent" "Transmission" "Azureus" \
-    "stratum+tcp" "mining.subscribe" "mining.authorize" "eth_submitLogin" "eth_submitWork" \
-    "falundafa.org" "minghui.org" "epochtimes.com" "ntdtv.com" "aboluowang.com" "secretchina.com"; do
-    add_tcp_string "$pattern"
-    add_udp_string "$pattern"
-done
+apply_family() {
+    IPT="$1"
+    CHAIN="$2"
+    command -v "$IPT" >/dev/null 2>&1 || return 0
+
+    "$IPT" -N "$CHAIN" 2>/dev/null || "$IPT" -F "$CHAIN" 2>/dev/null || return 0
+    while "$IPT" -C OUTPUT -j "$CHAIN" 2>/dev/null; do
+        "$IPT" -D OUTPUT -j "$CHAIN" 2>/dev/null || break
+    done
+    "$IPT" -I OUTPUT 1 -j "$CHAIN" 2>/dev/null || return 0
+
+    "$IPT" -A "$CHAIN" -p tcp -m multiport --dports 6881:6889,6969,2710,51413,16881,8999 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    "$IPT" -A "$CHAIN" -p udp -m multiport --dports 6881:6889,6969,2710,51413,16881,8999 -j DROP 2>/dev/null || true
+    "$IPT" -A "$CHAIN" -p tcp -m multiport --dports 3333,3334,3335,4444,5555,7777,9999,14433,14444,18081,18082 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+
+    for pattern in \
+        "BitTorrent protocol" "BitTorrent" "magnet:?xt=urn:btih" "peer_id=" ".torrent" "announce" "info_hash" \
+        "uTorrent" "Transmission" "Azureus" \
+        "stratum+tcp" "mining.subscribe" "mining.authorize" "eth_submitLogin" "eth_submitWork" \
+        "falundafa.org" "minghui.org" "epochtimes.com" "ntdtv.com" "aboluowang.com" "secretchina.com"; do
+        add_tcp_string "$IPT" "$CHAIN" "$pattern"
+        add_udp_string "$IPT" "$CHAIN" "$pattern"
+    done
+}
+
+apply_family iptables V2NODE_EGRESS_GUARD
+apply_family ip6tables V2NODE_EGRESS_GUARD6
 EOF
     chmod +x /usr/local/sbin/v2node-egress-guard.sh
 

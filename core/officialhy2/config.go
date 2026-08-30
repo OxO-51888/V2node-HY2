@@ -225,7 +225,7 @@ func (n *Node) getConn(info *panel.NodeInfo) (net.PacketConn, error) {
 	obfsType := ""
 	obfsPassword := ""
 	if info.Common != nil {
-		listenIP = info.Common.ListenIP
+		listenIP = normalizeListenIP(info.Common.ListenIP)
 		serverPort = info.Common.ServerPort
 		obfsType = info.Common.Obfs
 		obfsPassword = info.Common.ObfsPassword
@@ -505,6 +505,7 @@ func masqSiteByName(name string) string {
 }
 
 func formatAddress(ip string, port int) string {
+	ip = trimBracketedIP(strings.TrimSpace(ip))
 	if ip == "" {
 		return fmt.Sprintf(":%d", port)
 	}
@@ -512,4 +513,21 @@ func formatAddress(ip string, port int) string {
 		return fmt.Sprintf("[%s]:%d", ip, port)
 	}
 	return fmt.Sprintf("%s:%d", ip, port)
+}
+
+func normalizeListenIP(ip string) string {
+	ip = trimBracketedIP(strings.TrimSpace(ip))
+	switch strings.ToLower(ip) {
+	case "", "*", "0.0.0.0", "::":
+		return ""
+	default:
+		return ip
+	}
+}
+
+func trimBracketedIP(ip string) string {
+	if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
+		return strings.TrimSuffix(strings.TrimPrefix(ip, "["), "]")
+	}
+	return ip
 }
