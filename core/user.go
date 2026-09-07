@@ -38,11 +38,16 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 	return trafficSlice, nil
 }
 
-func (vc *V2Core) CommitUserTraffic(tag string, reported []panel.UserTraffic) {
+func (vc *V2Core) CommitUserTrafficSlice(tag string, reported []panel.UserTraffic) error {
 	if len(reported) == 0 || !vc.hy2.HasNode(tag) {
-		return
+		return nil
 	}
 	vc.hy2.CommitUserTraffic(tag, reported)
+	return nil
+}
+
+func (vc *V2Core) CommitUserTraffic(tag string, reported []panel.UserTraffic) {
+	_ = vc.CommitUserTrafficSlice(tag, reported)
 }
 
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {

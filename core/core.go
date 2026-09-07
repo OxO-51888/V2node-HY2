@@ -59,5 +59,6 @@ func (v *V2Core) Close() error {
 			return err
 		}
 	}
+	v.hy2 = nil
 	return nil
 }

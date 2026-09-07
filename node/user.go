@@ -15,22 +15,44 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
-	stepCtx, cancel := panelRequestContext(ctx)
-	err = c.apiClient.ReportUserTraffic(stepCtx, userTraffic)
-	cancel()
-	if err != nil {
-		log.WithFields(log.Fields{
-			"tag": c.tag,
-			"err": err,
-		}).Info("Report user traffic failed")
-		if isPanelTimeout(err) {
-			return nil
-		}
-	} else {
-		if len(userTraffic) > 0 {
-			c.server.CommitUserTraffic(c.tag, userTraffic)
+	if len(userTraffic) > 0 {
+		stepCtx, cancel := panelRequestContext(ctx)
+		err = c.apiClient.ReportUserTraffic(stepCtx, userTraffic)
+		cancel()
+		if err != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": err,
+			}).Info("Report user traffic failed")
+			if isPanelTimeout(err) {
+				return nil
+			}
+		} else {
+			if commitErr := c.server.CommitUserTrafficSlice(c.tag, userTraffic); commitErr != nil {
+				log.WithFields(log.Fields{
+					"tag": c.tag,
+					"err": commitErr,
+				}).Warn("Commit user traffic failed")
+				return commitErr
+			}
 			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
 			//log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
+			if hasPanelTaskBudget(ctx) {
+				_ = c.syncUsers(ctx)
+			}
+		}
+	} else {
+		stepCtx, cancel := panelRequestContext(ctx)
+		err = c.apiClient.ReportUserTraffic(stepCtx, userTraffic)
+		cancel()
+		if err != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": err,
+			}).Debug("Report empty traffic heartbeat failed")
+			if isPanelTimeout(err) {
+				return nil
+			}
 		} else {
 			log.WithField("tag", c.tag).Debug("Report empty traffic heartbeat")
 		}
@@ -69,20 +91,22 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			// json structure: { UID1:["ip1","ip2"],UID2:["ip3","ip4"] }
 			data[onlineuser.UID] = append(data[onlineuser.UID], onlineuser.IP)
 		}
-		if !hasPanelTaskBudget(ctx) {
-			log.WithField("tag", c.tag).Warn("Skip online users report because panel task budget is low")
-			return nil
-		}
-		stepCtx, cancel := panelRequestContext(ctx)
-		err := c.apiClient.ReportNodeOnlineUsers(stepCtx, &data)
-		cancel()
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Info("Report online users failed")
-			if isPanelTimeout(err) {
+		if len(data) != 0 {
+			if !hasPanelTaskBudget(ctx) {
+				log.WithField("tag", c.tag).Warn("Skip online users report because panel task budget is low")
 				return nil
+			}
+			stepCtx, cancel := panelRequestContext(ctx)
+			err := c.apiClient.ReportNodeOnlineUsers(stepCtx, &data)
+			cancel()
+			if err != nil {
+				log.WithFields(log.Fields{
+					"tag": c.tag,
+					"err": err,
+				}).Info("Report online users failed")
+				if isPanelTimeout(err) {
+					return nil
+				}
 			}
 		}
 		log.WithField("tag", c.tag).Infof("Total %d online users, %d Reported", totalOnline, len(result))

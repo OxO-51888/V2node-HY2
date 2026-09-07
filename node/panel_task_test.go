@@ -30,6 +30,12 @@ func TestStartTasksEnablesPanelTimeoutExit(t *testing.T) {
 	if c.userReportPeriodic == nil || !c.userReportPeriodic.ExitOnTimeout {
 		t.Fatal("reportUserTrafficTask must exit on timeout for systemd restart")
 	}
+	if c.nodeInfoMonitorPeriodic.ExitOnTimeoutAfter != 3 {
+		t.Fatalf("nodeInfoMonitor exit threshold = %d, want 3", c.nodeInfoMonitorPeriodic.ExitOnTimeoutAfter)
+	}
+	if c.userReportPeriodic.ExitOnTimeoutAfter != 3 {
+		t.Fatalf("reportUserTrafficTask exit threshold = %d, want 3", c.userReportPeriodic.ExitOnTimeoutAfter)
+	}
 	if c.nodeInfoMonitorPeriodic.Timeout != panelTaskTimeout {
 		t.Fatalf("nodeInfoMonitor timeout = %s, want %s", c.nodeInfoMonitorPeriodic.Timeout, panelTaskTimeout)
 	}

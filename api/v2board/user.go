@@ -52,6 +52,9 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}
+	if r.StatusCode() >= 400 {
+		return nil, fmt.Errorf("get user list: status %d", r.StatusCode())
+	}
 	userlist := &UserListBody{}
 	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
 		decoder := msgpack.NewDecoder(r.RawResponse.Body)
@@ -114,6 +117,9 @@ func (c *Client) GetUserAlive(ctx context.Context) (map[int]int, error) {
 	defer r.RawResponse.Body.Close()
 	if err := json.Unmarshal(r.Body(), c.AliveMap); err != nil {
 		fmt.Printf("unmarshal user alive list error: %s", err)
+		c.AliveMap.Alive = make(map[int]int)
+	}
+	if c.AliveMap.Alive == nil {
 		c.AliveMap.Alive = make(map[int]int)
 	}
 

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 )
@@ -55,5 +56,28 @@ func TestGetNodeInfoSkipsEmptyCachedResponse(t *testing.T) {
 	}
 	if info != nil {
 		t.Fatalf("GetNodeInfo() = %#v, want nil cached skip", info)
+	}
+}
+
+func TestGetNodeInfoRejectsServerError(t *testing.T) {
+	client, closeServer := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"error"}`))
+	})
+	defer closeServer()
+
+	_, err := client.GetNodeInfo(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "get node info: status 500") {
+		t.Fatalf("GetNodeInfo() error = %v, want status 500 error", err)
+	}
+}
+
+func TestIntervalToTimeAppliesMinimum(t *testing.T) {
+	if got := intervalToTime(1, time.Minute); got != minPanelInterval {
+		t.Fatalf("intervalToTime(1) = %s, want %s", got, minPanelInterval)
+	}
+	if got := intervalToTime("15", time.Minute); got != 15*time.Second {
+		t.Fatalf("intervalToTime(\"15\") = %s, want 15s", got)
 	}
 }

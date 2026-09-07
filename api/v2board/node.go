@@ -21,8 +21,6 @@ const (
 	Reality = 2
 )
 
-const defaultNodeInterval = 60 * time.Second
-
 type NodeInfo struct {
 	Id           int
 	Type         string
@@ -40,15 +38,16 @@ type CommonNode struct {
 	Routes     []Route     `json:"routes"`
 	BaseConfig *BaseConfig `json:"base_config"`
 	//vless vmess trojan
-	Tls                int         `json:"tls"`
-	TlsSettings        TlsSettings `json:"tls_settings"`
-	CertInfo           *CertInfo
-	Network            string          `json:"network"`
-	NetworkSettings    json.RawMessage `json:"network_settings"`
-	Encryption         string          `json:"encryption"`
-	EncryptionSettings EncSettings     `json:"encryption_settings"`
-	ServerName         string          `json:"server_name"`
-	Flow               string          `json:"flow"`
+	Tls                  int         `json:"tls"`
+	TlsSettings          TlsSettings `json:"tls_settings"`
+	CertInfo             *CertInfo
+	Network              string          `json:"network"`
+	NetworkSettings      json.RawMessage `json:"network_settings"`
+	TrustedXForwardedFor []string        `json:"trusted_x_forwarded_for"`
+	Encryption           string          `json:"encryption"`
+	EncryptionSettings   EncSettings     `json:"encryption_settings"`
+	ServerName           string          `json:"server_name"`
+	Flow                 string          `json:"flow"`
 	//shadowsocks
 	Cipher    string `json:"cipher"`
 	ServerKey string `json:"server_key"`
@@ -79,6 +78,12 @@ type BaseConfig struct {
 	NodeReportMinTraffic   int `json:"node_report_min_traffic"`
 }
 
+const (
+	defaultPanelPushInterval = time.Minute
+	defaultPanelPullInterval = time.Minute
+	minPanelInterval         = 5 * time.Second
+)
+
 type TlsSettings struct {
 	ServerName       string   `json:"server_name"`
 	ServerNames      []string `json:"server_names"`
@@ -92,6 +97,8 @@ type TlsSettings struct {
 	CertMode         string   `json:"cert_mode"`
 	CertFile         string   `json:"cert_file"`
 	KeyFile          string   `json:"key_file"`
+	TlsCert          string   `json:"tls_cert"`
+	TlsKey           string   `json:"tls_key"`
 	Provider         string   `json:"provider"`
 	DNSEnv           string   `json:"dns_env"`
 	RejectUnknownSni string   `json:"reject_unknown_sni"`
@@ -101,6 +108,8 @@ type CertInfo struct {
 	CertMode         string
 	CertFile         string
 	KeyFile          string
+	TlsCert          string
+	TlsKey           string
 	Email            string
 	CertDomain       string
 	DNSEnv           map[string]string
@@ -132,6 +141,9 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 
 	if r.StatusCode() == 304 {
 		return nil, nil
+	}
+	if r.StatusCode() >= 400 {
+		return nil, fmt.Errorf("get node info: status %d", r.StatusCode())
 	}
 	body := r.Body()
 	if len(bytes.TrimSpace(body)) == 0 {
@@ -204,14 +216,21 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 			}
 		}
 	}
+	if cm.CertInfo.CertMode == "remote" {
+		cm.CertInfo.TlsCert = cm.TlsSettings.TlsCert
+		cm.CertInfo.TlsKey = cm.TlsSettings.TlsKey
+	}
 
 	if cm.BaseConfig == nil {
-		cm.BaseConfig = &BaseConfig{}
+		cm.BaseConfig = &BaseConfig{
+			PushInterval: defaultPanelPushInterval.Seconds(),
+			PullInterval: defaultPanelPullInterval.Seconds(),
+		}
 	}
 
 	// set interval
-	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval, defaultNodeInterval)
-	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval, defaultNodeInterval)
+	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval, defaultPanelPushInterval)
+	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval, defaultPanelPullInterval)
 
 	node.Common = cm
 
@@ -219,42 +238,52 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 }
 
 func intervalToTime(i interface{}, fallback time.Duration) time.Duration {
-	var seconds int
+	var seconds int64
 	switch v := i.(type) {
 	case int:
-		seconds = v
+		seconds = int64(v)
 	case int8:
-		seconds = int(v)
+		seconds = int64(v)
 	case int16:
-		seconds = int(v)
+		seconds = int64(v)
 	case int32:
-		seconds = int(v)
+		seconds = int64(v)
 	case int64:
-		seconds = int(v)
+		seconds = v
 	case uint:
-		seconds = int(v)
+		seconds = int64(v)
 	case uint8:
-		seconds = int(v)
+		seconds = int64(v)
 	case uint16:
-		seconds = int(v)
+		seconds = int64(v)
 	case uint32:
-		seconds = int(v)
+		seconds = int64(v)
 	case uint64:
-		seconds = int(v)
-	case float32:
-		seconds = int(v)
-	case float64:
-		seconds = int(v)
-	case string:
-		n, err := strconv.Atoi(strings.TrimSpace(v))
-		if err == nil {
-			seconds = n
+		if v > uint64(1<<63-1) {
+			return fallback
 		}
+		seconds = int64(v)
+	case float32:
+		seconds = int64(v)
+	case float64:
+		seconds = int64(v)
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return fallback
+		}
+		seconds = parsed
+	default:
+		return fallback
 	}
 	if seconds <= 0 {
 		return fallback
 	}
-	return time.Duration(seconds) * time.Second
+	interval := time.Duration(seconds) * time.Second
+	if interval < minPanelInterval {
+		return minPanelInterval
+	}
+	return interval
 }
 
 func (t TlsSettings) EffectiveServerNames() []string {

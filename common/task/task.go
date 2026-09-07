@@ -12,18 +12,19 @@ import (
 )
 
 type Task struct {
-	Name            string
-	Interval        time.Duration
-	Execute         func(context.Context) error
-	Access          sync.RWMutex
-	ExecuteLock     sync.Mutex
-	Running         bool
-	ReloadCh        chan struct{}
-	ReloadOnTimeout bool
-	ExitOnTimeout   bool
-	Timeout         time.Duration
-	Stop            chan struct{}
-	timeoutCount    atomic.Int32
+	Name               string
+	Interval           time.Duration
+	Execute            func(context.Context) error
+	Access             sync.RWMutex
+	ExecuteLock        sync.Mutex
+	Running            bool
+	ReloadCh           chan struct{}
+	ReloadOnTimeout    bool
+	ExitOnTimeout      bool
+	ExitOnTimeoutAfter int32
+	Timeout            time.Duration
+	Stop               chan struct{}
+	timeoutCount       atomic.Int32
 }
 
 func (t *Task) Start(first bool) error {
@@ -84,6 +85,9 @@ func (t *Task) UpdateInterval(interval time.Duration) {
 func (t *Task) ExecuteWithTimeout() error {
 	if !t.ExecuteLock.TryLock() {
 		log.Warningf("Task %s previous execution still running, skip this interval", t.Name)
+		if t.ExitOnTimeout && t.timeoutCount.Load() > 0 {
+			t.handleExitOnTimeout(t.timeoutCount.Add(1))
+		}
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), t.currentTimeout())
@@ -105,11 +109,7 @@ func (t *Task) ExecuteWithTimeout() error {
 			default:
 			}
 		} else if t.ExitOnTimeout {
-			log.Errorf("Task %s execution timed out %d consecutive time(s), exiting for systemd restart", t.Name, count)
-			go func() {
-				time.Sleep(200 * time.Millisecond)
-				os.Exit(1)
-			}()
+			t.handleExitOnTimeout(count)
 		} else {
 			log.Errorf("Task %s execution timed out, will retry on next interval", t.Name)
 		}
@@ -121,6 +121,22 @@ func (t *Task) ExecuteWithTimeout() error {
 		}
 		return err
 	}
+}
+
+func (t *Task) handleExitOnTimeout(count int32) {
+	threshold := t.ExitOnTimeoutAfter
+	if threshold <= 0 {
+		threshold = 1
+	}
+	if count < threshold {
+		log.Errorf("Task %s execution timed out %d consecutive time(s), waiting before systemd restart threshold %d", t.Name, count, threshold)
+		return
+	}
+	log.Errorf("Task %s execution timed out %d consecutive time(s), exiting for systemd restart", t.Name, count)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		os.Exit(1)
+	}()
 }
 
 func (t *Task) currentTimeout() time.Duration {

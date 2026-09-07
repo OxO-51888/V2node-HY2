@@ -17,21 +17,23 @@ const minReloadInterval = time.Minute
 func (c *Controller) startTasks(node *panel.NodeInfo) {
 	// fetch node info task
 	c.nodeInfoMonitorPeriodic = &task.Task{
-		Name:          "nodeInfoMonitor",
-		Interval:      node.PullInterval,
-		Execute:       c.nodeInfoMonitor,
-		ReloadCh:      c.server.ReloadCh,
-		Timeout:       panelTaskTimeout,
-		ExitOnTimeout: true,
+		Name:               "nodeInfoMonitor",
+		Interval:           node.PullInterval,
+		Execute:            c.nodeInfoMonitor,
+		ReloadCh:           c.server.ReloadCh,
+		Timeout:            panelTaskTimeout,
+		ExitOnTimeout:      true,
+		ExitOnTimeoutAfter: 3,
 	}
 	// fetch user list task
 	c.userReportPeriodic = &task.Task{
-		Name:          "reportUserTrafficTask",
-		Interval:      node.PushInterval,
-		Execute:       c.reportUserTrafficTask,
-		ReloadCh:      c.server.ReloadCh,
-		Timeout:       panelTaskTimeout,
-		ExitOnTimeout: true,
+		Name:               "reportUserTrafficTask",
+		Interval:           node.PushInterval,
+		Execute:            c.reportUserTrafficTask,
+		ReloadCh:           c.server.ReloadCh,
+		Timeout:            panelTaskTimeout,
+		ExitOnTimeout:      true,
+		ExitOnTimeoutAfter: 3,
 	}
 	log.WithField("tag", c.tag).Info("Start monitor node status")
 	// delay to start nodeInfoMonitor
@@ -40,7 +42,7 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 	_ = c.userReportPeriodic.Start(false)
 	if node.Security == panel.Tls {
 		switch c.info.Common.CertInfo.CertMode {
-		case "none", "", "file", "self":
+		case "none", "", "file", "self", "remote":
 		default:
 			c.renewCertPeriodic = &task.Task{
 				Name:     "renewCertTask",
@@ -88,8 +90,14 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	}
 	log.WithField("tag", c.tag).Debug("Node info no change")
 
-	// get user info
-	stepCtx, cancel = panelRequestContext(ctx)
+	return c.syncUsers(ctx)
+}
+
+func (c *Controller) syncUsers(ctx context.Context) (err error) {
+	c.syncUsersAccess.Lock()
+	defer c.syncUsersAccess.Unlock()
+
+	stepCtx, cancel := panelRequestContext(ctx)
 	newU, err := c.apiClient.GetUserList(stepCtx)
 	cancel()
 	if err != nil {
@@ -192,7 +200,7 @@ func (c *Controller) requestReload() {
 		}
 		return
 	}
-	log.Panic("Reload failed")
+	log.WithField("tag", c.tag).Error("Reload requested but reload channel is not available")
 }
 
 func (c *Controller) applyRuntimeNodeInfo(node *panel.NodeInfo) {
@@ -239,6 +247,7 @@ func coreReloadReasons(oldNode, newNode *panel.NodeInfo) []string {
 	appendIfChanged("tls_settings", oldFp.Common.TlsSettings, newFp.Common.TlsSettings)
 	appendIfChanged("network", oldFp.Common.Network, newFp.Common.Network)
 	appendIfChanged("network_settings", oldFp.Common.NetworkSettings, newFp.Common.NetworkSettings)
+	appendIfChanged("trusted_x_forwarded_for", oldFp.Common.TrustedXForwardedFor, newFp.Common.TrustedXForwardedFor)
 	appendIfChanged("encryption", oldFp.Common.Encryption, newFp.Common.Encryption)
 	appendIfChanged("encryption_settings", oldFp.Common.EncryptionSettings, newFp.Common.EncryptionSettings)
 	appendIfChanged("server_name", oldFp.Common.ServerName, newFp.Common.ServerName)
@@ -276,6 +285,7 @@ type commonCoreFingerprint struct {
 	TlsSettings           panel.TlsSettings
 	Network               string
 	NetworkSettings       []byte
+	TrustedXForwardedFor  []string
 	Encryption            string
 	EncryptionSettings    panel.EncSettings
 	ServerName            string
@@ -312,6 +322,7 @@ func coreReloadFingerprint(node *panel.NodeInfo) nodeCoreFingerprint {
 		TlsSettings:           common.TlsSettings,
 		Network:               common.Network,
 		NetworkSettings:       []byte(common.NetworkSettings),
+		TrustedXForwardedFor:  common.TrustedXForwardedFor,
 		Encryption:            common.Encryption,
 		EncryptionSettings:    common.EncryptionSettings,
 		ServerName:            common.ServerName,

@@ -27,6 +27,7 @@ type Controller struct {
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
 	reloadAccess            sync.Mutex
+	syncUsersAccess         sync.Mutex
 	lastReloadAt            time.Time
 }
 
@@ -41,36 +42,75 @@ func NewController(api *panel.Client, conf *conf.NodeConfig, info *panel.NodeInf
 }
 
 // Start implement the Start() function of the service interface
-func (c *Controller) Start(x *core.V2Core) error {
+func (c *Controller) Start(x *core.V2Core) (err error) {
 	// Init Core
 	c.server = x
-	var err error
+	var limiterAdded bool
+	var nodeAdded bool
+	defer func() {
+		if err == nil {
+			return
+		}
+		if nodeAdded && c.server != nil && c.tag != "" {
+			if delErr := c.server.DelNode(c.tag); delErr != nil {
+				log.WithFields(log.Fields{
+					"tag": c.tag,
+					"err": delErr,
+				}).Warn("Cleanup node after failed start failed")
+			}
+		}
+		if limiterAdded && c.tag != "" {
+			limiter.DeleteLimiter(c.tag)
+		}
+	}()
 	// First fetch Node Info
 	node := c.info
 	if node == nil {
-		c.info, err = c.apiClient.GetNodeInfo(context.Background())
+		startCtx, cancel := panelRequestContext(context.Background())
+		c.info, err = c.apiClient.GetNodeInfo(startCtx)
+		cancel()
 		if err != nil {
 			return fmt.Errorf("get node info error: %s", err)
 		}
 		node = c.info
 	}
+	if node == nil {
+		return fmt.Errorf("node info is empty")
+	}
 	// Update user
-	c.userList, err = c.apiClient.GetUserList(context.Background())
+	startCtx, cancel := panelRequestContext(context.Background())
+	users, err := c.apiClient.GetUserList(startCtx)
+	cancel()
 	if err != nil {
-		return fmt.Errorf("get user list error: %s", err)
+		log.WithFields(log.Fields{
+			"tag": node.Tag,
+			"err": err,
+		}).Warn("Get user list failed on start, start node with cached or empty users")
+		if c.userList == nil {
+			c.userList = []panel.UserInfo{}
+		}
+	} else if users != nil {
+		c.userList = users
 	}
 	if len(c.userList) == 0 {
-		log.WithField("tag", node.Tag).Warn("No users returned from panel, start node with empty user list")
+		log.WithField("tag", node.Tag).Warn("User list is empty, start node without users")
 	}
-	c.aliveMap, err = c.apiClient.GetUserAlive(context.Background())
+	startCtx, cancel = panelRequestContext(context.Background())
+	c.aliveMap, err = c.apiClient.GetUserAlive(startCtx)
+	cancel()
 	if err != nil {
-		return fmt.Errorf("failed to get user alive list: %s", err)
+		log.WithFields(log.Fields{
+			"tag": node.Tag,
+			"err": err,
+		}).Warn("Get alive list failed, continue with empty alive list")
+		c.aliveMap = make(map[int]int)
 	}
 	c.tag = node.Tag
 
 	// add limiter
 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
 	c.limiter = l
+	limiterAdded = true
 	if node.Security == panel.Tls {
 		err = c.requestCert()
 		if err != nil {
@@ -82,6 +122,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	if err != nil {
 		return fmt.Errorf("add new node error: %s", err)
 	}
+	nodeAdded = true
 	added, err := c.server.AddUsers(&core.AddUsersParams{
 		Tag:      c.tag,
 		Users:    c.userList,
