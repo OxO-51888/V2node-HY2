@@ -123,6 +123,23 @@ func selectServerTxForCongestion(clientRx uint64, bandwidth BandwidthConfig) uin
 	return clientRx
 }
 
+func shouldUseBrutal(ignoreClientBandwidth bool, actualTx uint64, bandwidth BandwidthConfig) bool {
+	if actualTx == 0 {
+		return false
+	}
+	if bandwidth.ForceServerBandwidth && bandwidth.MaxTx > 0 {
+		return true
+	}
+	return !ignoreClientBandwidth
+}
+
+func advertiseRxAuto(ignoreClientBandwidth bool, bandwidth BandwidthConfig) bool {
+	if bandwidth.ForceServerBandwidth && bandwidth.MaxRx > 0 {
+		return false
+	}
+	return ignoreClientBandwidth
+}
+
 func (s *serverImpl) Close() error {
 	err := errors.Join(s.listener.Close(), s.tr.Close(), s.config.Conn.Close())
 	if s.config.Cleanup != nil {
@@ -179,7 +196,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !h.config.DisableUDP,
 				Rx:         h.config.BandwidthConfig.MaxRx,
-				RxAuto:     h.config.IgnoreClientBandwidth,
+				RxAuto:     advertiseRxAuto(h.config.IgnoreClientBandwidth, h.config.BandwidthConfig),
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
 			return
@@ -191,23 +208,18 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Set authenticated flag
 			h.authenticated = true
 			h.authID = id
-			if h.config.IgnoreClientBandwidth {
-				// Ignore client bandwidth and use the configured congestion controller.
+			if shouldUseBrutal(h.config.IgnoreClientBandwidth, actualTx, h.config.BandwidthConfig) {
+				congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
+			} else {
+				// Client doesn't know its own bandwidth, use the configured congestion controller.
 				congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
 				actualTx = 0
-			} else {
-				if actualTx > 0 {
-					congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
-				} else {
-					// Client doesn't know its own bandwidth, use the configured congestion controller.
-					congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
-				}
 			}
 			// Auth OK, send response
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !h.config.DisableUDP,
 				Rx:         h.config.BandwidthConfig.MaxRx,
-				RxAuto:     h.config.IgnoreClientBandwidth,
+				RxAuto:     advertiseRxAuto(h.config.IgnoreClientBandwidth, h.config.BandwidthConfig),
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
 			// Call event logger
