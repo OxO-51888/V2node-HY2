@@ -11,6 +11,7 @@ import (
 	"github.com/OxO-51888/V2node-HY2/common/counter"
 	"github.com/OxO-51888/V2node-HY2/common/format"
 	"github.com/OxO-51888/V2node-HY2/conf"
+	"github.com/OxO-51888/V2node-HY2/limiter"
 	"github.com/apernet/hysteria/core/v2/server"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/zap"
@@ -77,6 +78,8 @@ func (m *Manager) AddNode(tag string, info *panel.NodeInfo) error {
 	if _, exists := m.nodes[tag]; exists {
 		return fmt.Errorf("hysteria2 node %s already exists", tag)
 	}
+	limiterInfo, _ := limiter.GetLimiter(tag)
+	tagPrefix := tag + "|"
 
 	n := &Node{
 		tag:    tag,
@@ -84,14 +87,18 @@ func (m *Manager) AddNode(tag string, info *panel.NodeInfo) error {
 		unlock: m.unlock,
 		events: &eventLogger{
 			tag:                  tag,
+			tagPrefix:            tagPrefix,
+			limiter:              limiterInfo,
 			logger:               m.logger,
 			limitCheckCacheTTL:   defaultLimitCheckCacheTTL,
 			limitCacheSweepEvery: defaultLimitCacheSweepEvery,
 		},
 		traffic: &trafficLogger{
-			tag:     tag,
-			logger:  m.logger,
-			counter: counter.NewTrafficCounter(),
+			tag:       tag,
+			tagPrefix: tagPrefix,
+			limiter:   limiterInfo,
+			logger:    m.logger,
+			counter:   counter.NewTrafficCounter(),
 		},
 		info:      info,
 		stopCh:    make(chan struct{}),
@@ -152,6 +159,7 @@ func (m *Manager) AddUsers(tag string, users []panel.UserInfo) (int, error) {
 	n.auth.mu.Lock()
 	defer n.auth.mu.Unlock()
 	for _, user := range users {
+		n.traffic.ForgetUser(user.Uuid)
 		n.auth.users[user.Uuid] = user.Id
 	}
 	return len(users), nil
@@ -169,6 +177,7 @@ func (m *Manager) DelUsers(tag string, users []panel.UserInfo) error {
 	for _, user := range users {
 		delete(n.auth.users, user.Uuid)
 		n.traffic.counter.Delete(user.Uuid)
+		n.traffic.ForgetUser(user.Uuid)
 	}
 	return nil
 }

@@ -187,7 +187,7 @@ func (o *defaultOutbound) UDP(reqAddr string) (UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &defaultUDPConn{conn}, nil
+	return &defaultUDPConn{UDPConn: conn}, nil
 }
 
 func (o *defaultOutbound) CheckUDP(reqAddr string) error {
@@ -196,6 +196,12 @@ func (o *defaultOutbound) CheckUDP(reqAddr string) error {
 
 type defaultUDPConn struct {
 	*net.UDPConn
+	lastWriteAddr atomic.Value
+}
+
+type cachedUDPAddr struct {
+	addr string
+	udp  *net.UDPAddr
 }
 
 func (c *defaultUDPConn) ReadFrom(b []byte) (int, string, error) {
@@ -208,10 +214,14 @@ func (c *defaultUDPConn) ReadFrom(b []byte) (int, string, error) {
 }
 
 func (c *defaultUDPConn) WriteTo(b []byte, addr string) (int, error) {
+	if cached, ok := c.lastWriteAddr.Load().(cachedUDPAddr); ok && cached.addr == addr {
+		return c.UDPConn.WriteTo(b, cached.udp)
+	}
 	uAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return 0, err
 	}
+	c.lastWriteAddr.Store(cachedUDPAddr{addr: addr, udp: uAddr})
 	return c.UDPConn.WriteTo(b, uAddr)
 }
 

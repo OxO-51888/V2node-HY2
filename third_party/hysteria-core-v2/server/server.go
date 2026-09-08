@@ -276,17 +276,21 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 
 func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	trafficLogger := h.config.TrafficLogger
-	streamStats := &StreamStats{
-		AuthID:      h.authID,
-		ConnID:      h.connID,
-		InitialTime: time.Now(),
+	trackStats := shouldTrackStreamStats(trafficLogger)
+	var streamStats *StreamStats
+	if trackStats {
+		streamStats = &StreamStats{
+			AuthID:      h.authID,
+			ConnID:      h.connID,
+			InitialTime: time.Now(),
+		}
+		streamStats.State.Store(StreamStateInitial)
+		streamStats.LastActiveTime.Store(time.Now())
+		defer func() {
+			streamStats.State.Store(StreamStateClosed)
+		}()
 	}
-	streamStats.State.Store(StreamStateInitial)
-	streamStats.LastActiveTime.Store(time.Now())
-	defer func() {
-		streamStats.State.Store(StreamStateClosed)
-	}()
-	if trafficLogger != nil {
+	if trafficLogger != nil && streamStats != nil {
 		trafficLogger.TraceStream(stream, streamStats)
 		defer trafficLogger.UntraceStream(stream)
 	}
@@ -297,7 +301,9 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		_ = stream.Close()
 		return
 	}
-	streamStats.ReqAddr.Store(reqAddr)
+	if streamStats != nil {
+		streamStats.ReqAddr.Store(reqAddr)
+	}
 	// Call the hook if set
 	var putback []byte
 	var hooked bool
@@ -307,14 +313,18 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		// so that the client will send whatever request the hook wants to see.
 		// This is essentially a server-side fast-open.
 		if hooked {
-			streamStats.State.Store(StreamStateHooking)
+			if streamStats != nil {
+				streamStats.State.Store(StreamStateHooking)
+			}
 			_ = protocol.WriteTCPResponse(stream, true, "RequestHook enabled")
 			putback, err = h.config.RequestHook.TCP(stream, &reqAddr)
 			if err != nil {
 				_ = stream.Close()
 				return
 			}
-			streamStats.setHookedReqAddr(reqAddr)
+			if streamStats != nil {
+				streamStats.setHookedReqAddr(reqAddr)
+			}
 		}
 	}
 	// Log the event
@@ -322,7 +332,9 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		h.config.EventLogger.TCPRequest(h.conn.RemoteAddr(), h.authID, reqAddr)
 	}
 	// Dial target
-	streamStats.State.Store(StreamStateConnecting)
+	if streamStats != nil {
+		streamStats.State.Store(StreamStateConnecting)
+	}
 	tConn, err := h.config.Outbound.TCP(reqAddr)
 	if err != nil {
 		if !hooked {
@@ -338,11 +350,15 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	if !hooked {
 		_ = protocol.WriteTCPResponse(stream, true, "Connected")
 	}
-	streamStats.State.Store(StreamStateEstablished)
+	if streamStats != nil {
+		streamStats.State.Store(StreamStateEstablished)
+	}
 	// Put back the data if the hook requested
 	if len(putback) > 0 {
 		n, _ := tConn.Write(putback)
-		streamStats.Tx.Add(uint64(n))
+		if streamStats != nil {
+			streamStats.Tx.Add(uint64(n))
+		}
 	}
 	// Start proxying
 	if trafficLogger != nil {
@@ -361,6 +377,20 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	if err == errDisconnect {
 		_ = h.conn.CloseWithError(closeErrCodeTrafficLimitReached, "")
 	}
+}
+
+type streamStatsTracker interface {
+	TrackStreamStats() bool
+}
+
+func shouldTrackStreamStats(logger TrafficLogger) bool {
+	if logger == nil {
+		return false
+	}
+	if tracker, ok := logger.(streamStatsTracker); ok {
+		return tracker.TrackStreamStats()
+	}
+	return true
 }
 
 func (h *h3sHandler) masqHandler(w http.ResponseWriter, r *http.Request) {

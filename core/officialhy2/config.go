@@ -26,11 +26,11 @@ const (
 	kilobyteSize = byteSize * 1000
 	megabyteSize = kilobyteSize * 1000
 
-	defaultStreamReceiveWindow = 67108864
-	defaultConnReceiveWindow   = 268435456
-	defaultMaxIdleTimeout      = 60 * time.Second
-	defaultMaxIncomingStreams  = 16384
-	defaultUDPIdleTimeout      = 90 * time.Second
+	defaultStreamReceiveWindow = 8388608
+	defaultConnReceiveWindow   = defaultStreamReceiveWindow * 5 / 2
+	defaultMaxIdleTimeout      = 30 * time.Second
+	defaultMaxIncomingStreams  = 1024
+	defaultUDPIdleTimeout      = 60 * time.Second
 	defaultCertCheckInterval   = 5 * time.Second
 	defaultMasqRoot            = "/etc/v2node/masq"
 )
@@ -270,26 +270,26 @@ func (n *Node) getBandwidthConfig(info *panel.NodeInfo) *server.BandwidthConfig 
 }
 
 func (n *Node) getOutboundConfig() (server.Outbound, error) {
-	direct := outbounds.NewDirectOutboundSimple(outbounds.DirectOutboundModeAuto)
+	if n.unlock == nil || !n.unlock.Enable || len(n.unlock.SOCKS) == 0 {
+		return nil, nil
+	}
+
+	direct := newFastDirectOutbound()
 	pluggable := direct
 
-	if n.unlock != nil && n.unlock.Enable && len(n.unlock.SOCKS) > 0 {
-		unlockOutbound, entries := n.getUnlockOutbounds(direct)
-		if unlockOutbound != "" {
-			rules := n.getUnlockRules(unlockOutbound)
-			if rules != "" {
-				aclOutbound, err := outbounds.NewACLEngineFromString(rules, entries, nil)
-				if err != nil {
-					return nil, fmt.Errorf("build unlock acl: %w", err)
-				}
-				pluggable = aclOutbound
+	unlockOutbound, entries := n.getUnlockOutbounds(direct)
+	if unlockOutbound != "" {
+		rules := n.getUnlockRules(unlockOutbound)
+		if rules != "" {
+			aclOutbound, err := outbounds.NewACLEngineFromString(rules, entries, nil)
+			if err != nil {
+				return nil, fmt.Errorf("build unlock acl: %w", err)
 			}
+			pluggable = aclOutbound
 		}
 	}
 
-	return &outbounds.PluggableOutboundAdapter{
-		PluggableOutbound: pluggable,
-	}, nil
+	return &fastOutboundAdapter{outbound: pluggable}, nil
 }
 
 func (n *Node) getUnlockOutbounds(direct outbounds.PluggableOutbound) (string, []outbounds.OutboundEntry) {

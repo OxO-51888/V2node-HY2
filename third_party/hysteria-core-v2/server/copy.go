@@ -9,9 +9,11 @@ import (
 
 var errDisconnect = errors.New("traffic logger requested disconnect")
 
+const copyBufferSize = 32 * 1024
+
 var copyBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 32*1024)
+		b := make([]byte, copyBufferSize)
 		return &b
 	},
 }
@@ -47,15 +49,19 @@ func copyTwoWayEx(id string, serverRw, remoteRw io.ReadWriter, l TrafficLogger, 
 	errChan := make(chan error, 2)
 	go func() {
 		errChan <- copyBufferLog(serverRw, remoteRw, func(n uint64) bool {
-			stats.LastActiveTime.Store(time.Now())
-			stats.Rx.Add(n)
+			if stats != nil {
+				stats.LastActiveTime.Store(time.Now())
+				stats.Rx.Add(n)
+			}
 			return l.LogTraffic(id, 0, n)
 		})
 	}()
 	go func() {
 		errChan <- copyBufferLog(remoteRw, serverRw, func(n uint64) bool {
-			stats.LastActiveTime.Store(time.Now())
-			stats.Tx.Add(n)
+			if stats != nil {
+				stats.LastActiveTime.Store(time.Now())
+				stats.Tx.Add(n)
+			}
 			return l.LogTraffic(id, n, 0)
 		})
 	}()

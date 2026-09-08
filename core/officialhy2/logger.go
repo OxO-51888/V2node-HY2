@@ -20,6 +20,8 @@ const (
 
 type eventLogger struct {
 	tag                  string
+	tagPrefix            string
+	limiter              *limiter.Limiter
 	logger               *zap.Logger
 	limitCache           sync.Map
 	lastLimitCacheSweep  atomic.Int64
@@ -43,70 +45,97 @@ func (l *eventLogger) Disconnect(addr net.Addr, uuid string, err error) {
 
 func (l *eventLogger) TCPRequest(addr net.Addr, uuid, reqAddr string) {
 	l.checkLimit(addr, uuid)
-	l.logger.Debug("TCP request", zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.String("reqAddr", reqAddr))
+	if ce := l.logger.Check(zap.DebugLevel, "TCP request"); ce != nil {
+		ce.Write(zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.String("reqAddr", reqAddr))
+	}
 }
 
 func (l *eventLogger) TCPError(addr net.Addr, uuid, reqAddr string, err error) {
 	if err == nil {
-		l.logger.Debug("TCP closed", zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.String("reqAddr", reqAddr))
+		if ce := l.logger.Check(zap.DebugLevel, "TCP closed"); ce != nil {
+			ce.Write(zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.String("reqAddr", reqAddr))
+		}
 		return
 	}
-	l.logger.Debug("TCP error", zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.String("reqAddr", reqAddr), zap.Error(err))
+	if ce := l.logger.Check(zap.DebugLevel, "TCP error"); ce != nil {
+		ce.Write(zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.String("reqAddr", reqAddr), zap.Error(err))
+	}
 }
 
 func (l *eventLogger) UDPRequest(addr net.Addr, uuid string, sessionID uint32, reqAddr string) {
 	l.checkLimit(addr, uuid)
-	l.logger.Debug("UDP request", zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.Uint32("sessionId", sessionID), zap.String("reqAddr", reqAddr))
+	if ce := l.logger.Check(zap.DebugLevel, "UDP request"); ce != nil {
+		ce.Write(zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.Uint32("sessionId", sessionID), zap.String("reqAddr", reqAddr))
+	}
 }
 
 func (l *eventLogger) UDPError(addr net.Addr, uuid string, sessionID uint32, err error) {
 	if err == nil {
-		l.logger.Debug("UDP closed", zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.Uint32("sessionId", sessionID))
+		if ce := l.logger.Check(zap.DebugLevel, "UDP closed"); ce != nil {
+			ce.Write(zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.Uint32("sessionId", sessionID))
+		}
 		return
 	}
-	l.logger.Debug("UDP error", zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.Uint32("sessionId", sessionID), zap.Error(err))
+	if ce := l.logger.Check(zap.DebugLevel, "UDP error"); ce != nil {
+		ce.Write(zap.String("addr", addr.String()), zap.String("uuid", uuid), zap.Uint32("sessionId", sessionID), zap.Error(err))
+	}
 }
 
 func (l *eventLogger) checkLimit(addr net.Addr, uuid string) {
 	ip := extractIPFromAddr(addr)
-	cacheKey := uuid + "|" + ip + "|" + addr.Network()
+	taguuid := l.userTag(uuid)
+	cacheKey := taguuid + "|" + ip + "|" + addr.Network()
 	now := time.Now()
 	if cached, ok := l.limitCache.Load(cacheKey); ok {
 		entry := cached.(limitCacheEntry)
 		if now.Before(entry.expiresAt) {
 			if entry.reject {
-				l.setUserOverLimit(uuid, true)
+				l.setUserOverLimit(taguuid, true)
 			}
 			return
 		}
 		l.limitCache.Delete(cacheKey)
 	}
 
-	limiterInfo, err := limiter.GetLimiter(l.tag)
+	limiterInfo, err := l.getLimiter()
 	if err != nil {
 		l.logger.Error("get limiter error", zap.String("tag", l.tag), zap.Error(err))
 		return
 	}
-	_, reject := limiterInfo.CheckLimit(userTag(l.tag, uuid), ip, addr.Network() == "tcp")
+	_, reject := limiterInfo.CheckLimit(taguuid, ip, addr.Network() == "tcp")
 	l.limitCache.Store(cacheKey, limitCacheEntry{
 		reject:    reject,
 		expiresAt: now.Add(l.limitCheckCacheTTL),
 	})
-	setLimiterOverLimit(limiterInfo, l.tag, uuid, reject)
+	setLimiterOverLimit(limiterInfo, taguuid, reject)
 	l.sweepLimitCache(now)
 }
 
-func (l *eventLogger) setUserOverLimit(uuid string, reject bool) {
-	limiterInfo, err := limiter.GetLimiter(l.tag)
+func (l *eventLogger) setUserOverLimit(taguuid string, reject bool) {
+	limiterInfo, err := l.getLimiter()
 	if err != nil {
 		l.logger.Error("get limiter error", zap.String("tag", l.tag), zap.Error(err))
 		return
 	}
-	setLimiterOverLimit(limiterInfo, l.tag, uuid, reject)
+	setLimiterOverLimit(limiterInfo, taguuid, reject)
 }
 
-func setLimiterOverLimit(limiterInfo *limiter.Limiter, tag, uuid string, reject bool) {
-	if userLimit, ok := limiterInfo.UserLimitInfo.Load(userTag(tag, uuid)); ok {
+func (l *eventLogger) getLimiter() (*limiter.Limiter, error) {
+	if l.limiter != nil {
+		return l.limiter, nil
+	}
+	return limiter.GetLimiter(l.tag)
+}
+
+func (l *eventLogger) userTag(uuid string) string {
+	if l.tagPrefix != "" {
+		return l.tagPrefix + uuid
+	}
+	return userTag(l.tag, uuid)
+}
+
+func setLimiterOverLimit(limiterInfo *limiter.Limiter, taguuid string, reject bool) {
+	if userLimit, ok := limiterInfo.UserLimitInfo.Load(taguuid); ok {
 		userLimit.(*limiter.UserLimitInfo).OverLimit = reject
 	}
 }

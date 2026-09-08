@@ -73,7 +73,7 @@ func TestFormatAddressSupportsIPv6(t *testing.T) {
 	}
 }
 
-func TestQUICConfigUsesTunedReceiveWindows(t *testing.T) {
+func TestQUICConfigUsesOfficialDefaults(t *testing.T) {
 	n := &Node{}
 	cfg := n.getQUICConfig()
 	if cfg.InitialStreamReceiveWindow != defaultStreamReceiveWindow {
@@ -189,6 +189,54 @@ func TestUnlockOutboundConfigBuildsACL(t *testing.T) {
 	}}
 	if _, err := n.getOutboundConfig(); err != nil {
 		t.Fatalf("getOutboundConfig() error = %v", err)
+	}
+}
+
+func TestOutboundConfigUsesCoreDefaultWithoutUnlock(t *testing.T) {
+	tests := []*conf.UnlockConfig{
+		nil,
+		{Enable: false},
+		{Enable: true},
+	}
+	for _, unlock := range tests {
+		n := &Node{unlock: unlock}
+		outbound, err := n.getOutboundConfig()
+		if err != nil {
+			t.Fatalf("getOutboundConfig() error = %v", err)
+		}
+		if outbound != nil {
+			t.Fatalf("outbound = %T, want nil core default when unlock is not configured", outbound)
+		}
+	}
+}
+
+func TestUnlockOutboundConfigUsesFastAdapter(t *testing.T) {
+	n := &Node{unlock: &conf.UnlockConfig{
+		Enable:          true,
+		DefaultOutbound: "sg",
+		SOCKS: []conf.SOCKSConfig{{
+			Tag:     "sg",
+			Address: "127.0.0.1",
+			Port:    1080,
+		}},
+		Rules: []string{"netflix.com"},
+	}}
+	outbound, err := n.getOutboundConfig()
+	if err != nil {
+		t.Fatalf("getOutboundConfig() error = %v", err)
+	}
+	if _, ok := outbound.(*fastOutboundAdapter); !ok {
+		t.Fatalf("outbound = %T, want *fastOutboundAdapter", outbound)
+	}
+}
+
+func TestParseAddrExSupportsIPv6(t *testing.T) {
+	addr, err := parseAddrEx("[2001:db8::1]:443")
+	if err != nil {
+		t.Fatalf("parseAddrEx() error = %v", err)
+	}
+	if addr.Host != "2001:db8::1" || addr.Port != 443 {
+		t.Fatalf("addr = %#v, want IPv6 host and port 443", addr)
 	}
 }
 
