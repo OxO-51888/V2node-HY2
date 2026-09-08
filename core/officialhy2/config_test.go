@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
 	"github.com/OxO-51888/V2node-HY2/conf"
 	"github.com/apernet/hysteria/extras/v2/outbounds"
 )
@@ -89,6 +90,25 @@ func TestQUICConfigUsesTunedReceiveWindows(t *testing.T) {
 	}
 	if cfg.MaxIncomingStreams != defaultMaxIncomingStreams {
 		t.Fatalf("max incoming streams = %d, want %d", cfg.MaxIncomingStreams, defaultMaxIncomingStreams)
+	}
+}
+
+func TestBandwidthConfigForcesServerBandwidth(t *testing.T) {
+	n := &Node{}
+	cfg := n.getBandwidthConfig(&panel.NodeInfo{
+		Common: &panel.CommonNode{
+			UpMbps:   500,
+			DownMbps: 500,
+		},
+	})
+	if !cfg.ForceServerBandwidth {
+		t.Fatal("force server bandwidth is disabled")
+	}
+	if cfg.MaxTx != 500*megabyteSize/8 {
+		t.Fatalf("max tx = %d, want %d", cfg.MaxTx, 500*megabyteSize/8)
+	}
+	if cfg.MaxRx != 500*megabyteSize/8 {
+		t.Fatalf("max rx = %d, want %d", cfg.MaxRx, 500*megabyteSize/8)
 	}
 }
 

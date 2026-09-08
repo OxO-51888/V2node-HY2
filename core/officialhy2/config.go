@@ -26,8 +26,8 @@ const (
 	kilobyteSize = byteSize * 1000
 	megabyteSize = kilobyteSize * 1000
 
-	defaultStreamReceiveWindow = 33554432
-	defaultConnReceiveWindow   = 134217728
+	defaultStreamReceiveWindow = 67108864
+	defaultConnReceiveWindow   = 268435456
 	defaultMaxIdleTimeout      = 60 * time.Second
 	defaultMaxIncomingStreams  = 16384
 	defaultUDPIdleTimeout      = 90 * time.Second
@@ -256,7 +256,7 @@ func (n *Node) getConn(info *panel.NodeInfo) (net.PacketConn, error) {
 }
 
 func (n *Node) getBandwidthConfig(info *panel.NodeInfo) *server.BandwidthConfig {
-	bandwidth := &server.BandwidthConfig{}
+	bandwidth := &server.BandwidthConfig{ForceServerBandwidth: true}
 	if info.Common == nil {
 		return bandwidth
 	}

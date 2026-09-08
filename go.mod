@@ -220,3 +220,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/apernet/hysteria/core/v2 => ./third_party/hysteria-core-v2
