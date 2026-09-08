@@ -72,6 +72,26 @@ func TestFormatAddressSupportsIPv6(t *testing.T) {
 	}
 }
 
+func TestQUICConfigUsesTunedReceiveWindows(t *testing.T) {
+	n := &Node{}
+	cfg := n.getQUICConfig()
+	if cfg.InitialStreamReceiveWindow != defaultStreamReceiveWindow {
+		t.Fatalf("initial stream receive window = %d, want %d", cfg.InitialStreamReceiveWindow, defaultStreamReceiveWindow)
+	}
+	if cfg.MaxStreamReceiveWindow != defaultStreamReceiveWindow {
+		t.Fatalf("max stream receive window = %d, want %d", cfg.MaxStreamReceiveWindow, defaultStreamReceiveWindow)
+	}
+	if cfg.InitialConnectionReceiveWindow != defaultConnReceiveWindow {
+		t.Fatalf("initial connection receive window = %d, want %d", cfg.InitialConnectionReceiveWindow, defaultConnReceiveWindow)
+	}
+	if cfg.MaxConnectionReceiveWindow != defaultConnReceiveWindow {
+		t.Fatalf("max connection receive window = %d, want %d", cfg.MaxConnectionReceiveWindow, defaultConnReceiveWindow)
+	}
+	if cfg.MaxIncomingStreams != defaultMaxIncomingStreams {
+		t.Fatalf("max incoming streams = %d, want %d", cfg.MaxIncomingStreams, defaultMaxIncomingStreams)
+	}
+}
+
 func TestUnlockRulesUseDefaultOutbound(t *testing.T) {
 	n := &Node{unlock: &conf.UnlockConfig{
 		Enable:          true,

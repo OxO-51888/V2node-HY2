@@ -26,10 +26,10 @@ const (
 	kilobyteSize = byteSize * 1000
 	megabyteSize = kilobyteSize * 1000
 
-	defaultStreamReceiveWindow = 16777216
-	defaultConnReceiveWindow   = 41943040
+	defaultStreamReceiveWindow = 33554432
+	defaultConnReceiveWindow   = 134217728
 	defaultMaxIdleTimeout      = 60 * time.Second
-	defaultMaxIncomingStreams  = 4096
+	defaultMaxIncomingStreams  = 16384
 	defaultUDPIdleTimeout      = 90 * time.Second
 	defaultCertCheckInterval   = 5 * time.Second
 	defaultMasqRoot            = "/etc/v2node/masq"
