@@ -33,7 +33,11 @@ func newFastDirectOutbound() outbounds.PluggableOutbound {
 }
 
 func (d *fastDirectOutbound) TCP(reqAddr *outbounds.AddrEx) (net.Conn, error) {
-	return d.dialer.Dial("tcp", reqAddr.String())
+	address := reqAddr.String()
+	if tcpAddr, err := resolveAddrExTCP(reqAddr); err == nil {
+		address = tcpAddr
+	}
+	return d.dialer.Dial("tcp4", address)
 }
 
 func (d *fastDirectOutbound) UDP(_ *outbounds.AddrEx) (outbounds.UDPConn, error) {
@@ -100,6 +104,35 @@ func resolveAddrExUDP(addr *outbounds.AddrEx) (*net.UDPAddr, error) {
 		}
 	}
 	return nil, fmt.Errorf("no address available for %s", net.JoinHostPort(addr.Host, strconv.Itoa(int(addr.Port))))
+}
+
+func resolveAddrExTCP(addr *outbounds.AddrEx) (string, error) {
+	port := strconv.Itoa(int(addr.Port))
+	if addr.ResolveInfo != nil {
+		if addr.ResolveInfo.IPv4 != nil {
+			return net.JoinHostPort(addr.ResolveInfo.IPv4.String(), port), nil
+		}
+		if addr.ResolveInfo.Err != nil {
+			return "", fmt.Errorf("resolve error: %w", addr.ResolveInfo.Err)
+		}
+		return "", fmt.Errorf("no IPv4 address available for %s", net.JoinHostPort(addr.Host, port))
+	}
+	if ip := net.ParseIP(addr.Host); ip != nil {
+		if ip.To4() == nil {
+			return "", fmt.Errorf("IPv6 literal is not allowed for forced IPv4 outbound: %s", addr.Host)
+		}
+		return net.JoinHostPort(ip.String(), port), nil
+	}
+	ips, err := net.LookupIP(addr.Host)
+	if err != nil {
+		return "", err
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return net.JoinHostPort(ip.String(), port), nil
+		}
+	}
+	return "", fmt.Errorf("no IPv4 address available for %s", net.JoinHostPort(addr.Host, port))
 }
 
 func preferredUDPIP(info *outbounds.ResolveInfo) net.IP {

@@ -1,6 +1,7 @@
 package officialhy2
 
 import (
+	"net"
 	"strings"
 	"testing"
 
@@ -227,6 +228,23 @@ func TestUnlockOutboundConfigUsesFastAdapter(t *testing.T) {
 	}
 	if _, ok := outbound.(*fastOutboundAdapter); !ok {
 		t.Fatalf("outbound = %T, want *fastOutboundAdapter", outbound)
+	}
+}
+
+func TestResolveAddrExTCPPrefersIPv4(t *testing.T) {
+	got, err := resolveAddrExTCP(&outbounds.AddrEx{
+		Host: "gemini.google.com",
+		Port: 443,
+		ResolveInfo: &outbounds.ResolveInfo{
+			IPv4: net.ParseIP("142.251.1.1"),
+			IPv6: net.ParseIP("2001:4860:4860::8888"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolveAddrExTCP() error = %v", err)
+	}
+	if got != "142.251.1.1:443" {
+		t.Fatalf("resolveAddrExTCP() = %q, want IPv4 endpoint", got)
 	}
 }
 
