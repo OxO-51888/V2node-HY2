@@ -176,6 +176,9 @@ func (m *Manager) DelUsers(tag string, users []panel.UserInfo) error {
 	defer n.auth.mu.Unlock()
 	for _, user := range users {
 		delete(n.auth.users, user.Uuid)
+		if limit, err := n.traffic.getLimiter(); err == nil {
+			limit.RevokeUser(n.traffic.userTag(user.Uuid))
+		}
 		n.traffic.counter.Delete(user.Uuid)
 		n.traffic.ForgetUser(user.Uuid)
 	}
@@ -241,43 +244,50 @@ func (n *Node) newServer() (server.Server, error) {
 		return nil, err
 	}
 	hyConfig.Authenticator = n.auth
-	return server.NewServer(hyConfig)
+	s, err := server.NewServer(hyConfig)
+	if err != nil {
+		_ = hyConfig.Conn.Close()
+	}
+	return s, err
 }
 
 func (n *Node) serveLoop() {
+	n.runServeLoop(n.newServer, time.Second)
+}
+
+func (n *Node) runServeLoop(create func() (server.Server, error), retryDelay time.Duration) {
 	defer close(n.serveDone)
 
-	backoff := time.Second
+	backoff := retryDelay
 	for {
-		n.serverMu.Lock()
-		s := n.server
-		n.serverMu.Unlock()
-		if s == nil {
-			return
-		}
-
-		err := s.Serve()
 		select {
 		case <-n.stopCh:
 			return
 		default:
 		}
-
-		if err != nil && !isServerClosedError(err) {
-			log.WithFields(log.Fields{
-				"tag": n.tag,
-				"err": err,
-			}).Error("official hysteria2 server stopped unexpectedly")
-		} else {
-			log.WithField("tag", n.tag).Warn("official hysteria2 server stopped unexpectedly")
+		n.serverMu.Lock()
+		s := n.server
+		n.serverMu.Unlock()
+		if s != nil {
+			err := s.Serve()
+			select {
+			case <-n.stopCh:
+				return
+			default:
+			}
+			if err != nil && !isServerClosedError(err) {
+				log.WithFields(log.Fields{"tag": n.tag, "err": err}).Error("official hysteria2 server stopped unexpectedly")
+			} else {
+				log.WithField("tag", n.tag).Warn("official hysteria2 server stopped unexpectedly")
+			}
+			_ = n.closeServer()
 		}
 
-		_ = n.closeServer()
 		if !n.waitBeforeRestart(backoff) {
 			return
 		}
 
-		nextServer, err := n.newServer()
+		nextServer, err := create()
 		if err != nil {
 			log.WithFields(log.Fields{
 				"tag":     n.tag,
@@ -288,10 +298,17 @@ func (n *Node) serveLoop() {
 			continue
 		}
 		n.serverMu.Lock()
+		select {
+		case <-n.stopCh:
+			n.serverMu.Unlock()
+			_ = nextServer.Close()
+			return
+		default:
+		}
 		n.server = nextServer
 		n.serverMu.Unlock()
 		log.WithField("tag", n.tag).Warn("official hysteria2 server restarted")
-		backoff = time.Second
+		backoff = retryDelay
 	}
 }
 

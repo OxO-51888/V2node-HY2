@@ -2,8 +2,10 @@ package limiter
 
 import (
 	"errors"
+	"maps"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
@@ -19,6 +21,7 @@ func Init() {
 }
 
 type Limiter struct {
+	stateMu       sync.Mutex
 	Nodetype      string         // Node type, e.g. "v2ray", "trojan", "shadowsocks"
 	SpeedLimit    int            // Node speed limit in Mbps
 	UserOnlineIP  *sync.Map      // Key: TagUUID, value: {Key: Ip, value: Uid}
@@ -35,7 +38,8 @@ type UserLimitInfo struct {
 	DeviceLimit       int
 	DynamicSpeedLimit int
 	ExpireTime        int64
-	OverLimit         bool
+	OverLimit         atomic.Bool
+	Revoked           atomic.Bool
 }
 
 func AddLimiter(nodetype string, tag string, users []panel.UserInfo, aliveList map[int]int) *Limiter {
@@ -44,7 +48,7 @@ func AddLimiter(nodetype string, tag string, users []panel.UserInfo, aliveList m
 		UserOnlineIP:  new(sync.Map),
 		UserLimitInfo: new(sync.Map),
 		SpeedLimiter:  new(sync.Map),
-		AliveList:     aliveList,
+		AliveList:     maps.Clone(aliveList),
 		OldUserOnline: new(sync.Map),
 	}
 	uuidmap := make(map[string]int)
@@ -58,7 +62,6 @@ func AddLimiter(nodetype string, tag string, users []panel.UserInfo, aliveList m
 		if users[i].DeviceLimit != 0 {
 			userLimit.DeviceLimit = users[i].DeviceLimit
 		}
-		userLimit.OverLimit = false
 		l.UserLimitInfo.Store(format.UserTag(tag, users[i].Uuid), userLimit)
 	}
 	l.UUIDtoUID = uuidmap
@@ -85,7 +88,10 @@ func DeleteLimiter(tag string) {
 }
 
 func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel.UserInfo, modified []panel.UserInfo) {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
 	for i := range deleted {
+		l.RevokeUser(format.UserTag(tag, deleted[i].Uuid))
 		l.UserLimitInfo.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.UserOnlineIP.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.SpeedLimiter.Delete(format.UserTag(tag, deleted[i].Uuid))
@@ -123,13 +129,14 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 		if added[i].DeviceLimit != 0 {
 			userLimit.DeviceLimit = added[i].DeviceLimit
 		}
-		userLimit.OverLimit = false
 		l.UserLimitInfo.Store(format.UserTag(tag, added[i].Uuid), userLimit)
 		l.UUIDtoUID[added[i].Uuid] = added[i].Id
 	}
 }
 
 func (l *Limiter) UpdateDynamicSpeedLimit(tag, uuid string, limit int, expire time.Time) error {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
 	if v, ok := l.UserLimitInfo.Load(format.UserTag(tag, uuid)); ok {
 		info := v.(*UserLimitInfo)
 		info.DynamicSpeedLimit = limit
@@ -141,6 +148,8 @@ func (l *Limiter) UpdateDynamicSpeedLimit(tag, uuid string, limit int, expire ti
 }
 
 func (l *Limiter) CheckLimit(taguuid string, ip string, noUDPsource bool) (DynamicBucket *rate.DynamicBucket, Reject bool) {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
 	// check if ipv4 mapped ipv6
 	ip = strings.TrimPrefix(ip, "::ffff:")
 
@@ -151,16 +160,15 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noUDPsource bool) (Dynam
 	var uid int
 	if v, ok := l.UserLimitInfo.Load(taguuid); ok {
 		u := v.(*UserLimitInfo)
+		if u.Revoked.Load() {
+			return nil, true
+		}
 		deviceLimit = u.DeviceLimit
 		uid = u.UID
 		if u.ExpireTime < time.Now().Unix() && u.ExpireTime != 0 {
-			if u.SpeedLimit != 0 {
-				userLimit = u.SpeedLimit
-				u.DynamicSpeedLimit = 0
-				u.ExpireTime = 0
-			} else {
-				l.UserLimitInfo.Delete(taguuid)
-			}
+			userLimit = u.SpeedLimit
+			u.DynamicSpeedLimit = 0
+			u.ExpireTime = 0
 		} else {
 			userLimit = determineSpeedLimit(u.SpeedLimit, u.DynamicSpeedLimit)
 		}
@@ -217,6 +225,8 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noUDPsource bool) (Dynam
 }
 
 func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
 	var onlineUser []panel.OnlineUser
 	l.OldUserOnline = new(sync.Map)
 	l.UserOnlineIP.Range(func(key, value interface{}) bool {
@@ -234,6 +244,19 @@ func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 	})
 
 	return &onlineUser, nil
+}
+
+func (l *Limiter) UpdateAliveList(alive map[int]int) {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
+	l.AliveList = maps.Clone(alive)
+}
+
+// Cached traffic callbacks must observe revocation even after the map entry is removed.
+func (l *Limiter) RevokeUser(taguuid string) {
+	if value, ok := l.UserLimitInfo.Load(taguuid); ok {
+		value.(*UserLimitInfo).Revoked.Store(true)
+	}
 }
 
 type UserIpList struct {

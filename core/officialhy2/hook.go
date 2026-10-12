@@ -25,11 +25,10 @@ type trafficUserCache struct {
 
 func (h *trafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	user := h.getUser(id)
-	if user == nil {
+	if user == nil || user.limit == nil || user.limit.Revoked.Load() {
 		return false
 	}
-	if user.limit != nil && user.limit.OverLimit {
-		user.limit.OverLimit = false
+	if user.limit.OverLimit.Swap(false) {
 		return false
 	}
 	if rx > 0 {
@@ -55,7 +54,12 @@ func (h *trafficLogger) ForgetUser(id string) {
 
 func (h *trafficLogger) getUser(id string) *trafficUserCache {
 	if cached, ok := h.users.Load(id); ok {
-		return cached.(*trafficUserCache)
+		user := cached.(*trafficUserCache)
+		if user.limit.Revoked.Load() {
+			h.users.CompareAndDelete(id, user)
+			return nil
+		}
+		return user
 	}
 	limiterInfo, err := h.getLimiter()
 	if err != nil {
@@ -67,12 +71,12 @@ func (h *trafficLogger) getUser(id string) *trafficUserCache {
 	if userLimit, ok := limiterInfo.UserLimitInfo.Load(h.userTag(id)); ok {
 		userLimitInfo = userLimit.(*limiter.UserLimitInfo)
 	}
+	if userLimitInfo == nil || userLimitInfo.Revoked.Load() {
+		return nil
+	}
 	user := &trafficUserCache{
 		storage: h.counter.GetCounter(id),
 		limit:   userLimitInfo,
-	}
-	if userLimitInfo == nil {
-		return user
 	}
 	actual, _ := h.users.LoadOrStore(id, user)
 	return actual.(*trafficUserCache)

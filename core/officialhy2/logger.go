@@ -136,7 +136,7 @@ func (l *eventLogger) userTag(uuid string) string {
 
 func setLimiterOverLimit(limiterInfo *limiter.Limiter, taguuid string, reject bool) {
 	if userLimit, ok := limiterInfo.UserLimitInfo.Load(taguuid); ok {
-		userLimit.(*limiter.UserLimitInfo).OverLimit = reject
+		userLimit.(*limiter.UserLimitInfo).OverLimit.Store(reject)
 	}
 }
 

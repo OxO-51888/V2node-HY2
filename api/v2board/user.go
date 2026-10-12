@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	"encoding/json/jsontext"
 	"encoding/json/v2"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -52,7 +51,7 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}
-	if r.StatusCode() >= 400 {
+	if r.StatusCode() != 200 {
 		return nil, fmt.Errorf("get user list: status %d", r.StatusCode())
 	}
 	userlist := &UserListBody{}
@@ -62,34 +61,12 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 			return nil, fmt.Errorf("decode user list error: %w", err)
 		}
 	} else {
-		dec := jsontext.NewDecoder(r.RawResponse.Body)
-		for {
-			tok, err := dec.ReadToken()
-			if err != nil {
-				return nil, fmt.Errorf("decode user list error: %w", err)
-			}
-			if tok.Kind() == '"' && tok.String() == "users" {
-				break
-			}
-		}
-		tok, err := dec.ReadToken()
-		if err != nil {
+		if err := json.UnmarshalRead(r.RawResponse.Body, userlist); err != nil {
 			return nil, fmt.Errorf("decode user list error: %w", err)
 		}
-		if tok.Kind() != '[' {
-			return nil, fmt.Errorf(`decode user list error: expected "users" array`)
-		}
-		for dec.PeekKind() != ']' {
-			val, err := dec.ReadValue()
-			if err != nil {
-				return nil, fmt.Errorf("decode user list error: read user object: %w", err)
-			}
-			var u UserInfo
-			if err := json.Unmarshal(val, &u); err != nil {
-				return nil, fmt.Errorf("decode user list error: unmarshal user error: %w", err)
-			}
-			userlist.Users = append(userlist.Users, u)
-		}
+	}
+	if userlist.Users == nil {
+		return nil, fmt.Errorf("decode user list error: missing or null users array")
 	}
 	c.userEtag = r.Header().Get("ETag")
 	return userlist.Users, nil

@@ -77,11 +77,11 @@ func (n *Node) buildConfig(info *panel.NodeInfo) (*server.Config, error) {
 		return nil, err
 	}
 	quicConfig := n.getQUICConfig()
-	conn, err := n.getConn(info)
+	outbound, err := n.getOutboundConfig()
 	if err != nil {
 		return nil, err
 	}
-	outbound, err := n.getOutboundConfig()
+	conn, err := n.getConn(info)
 	if err != nil {
 		return nil, err
 	}
@@ -238,6 +238,7 @@ func (n *Node) getConn(info *panel.NodeInfo) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	prepareUDPReceiveBuffer(conn)
 
 	switch strings.ToLower(obfsType) {
 	case "", "plain":
