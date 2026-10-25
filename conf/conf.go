@@ -24,11 +24,12 @@ type LogConfig struct {
 }
 
 type NodeConfig struct {
-	APIHost    string `mapstructure:"ApiHost"`
-	NodeID     int    `mapstructure:"NodeID"`
-	Key        string `mapstructure:"ApiKey"`
-	Timeout    int    `mapstructure:"Timeout"`
-	RetryCount *int   `mapstructure:"RetryCount"`
+	StateDirectory string `mapstructure:"StateDirectory"`
+	APIHost        string `mapstructure:"ApiHost"`
+	NodeID         int    `mapstructure:"NodeID"`
+	Key            string `mapstructure:"ApiKey"`
+	Timeout        int    `mapstructure:"Timeout"`
+	RetryCount     *int   `mapstructure:"RetryCount"`
 }
 
 type UnlockConfig struct {

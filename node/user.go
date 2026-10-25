@@ -7,111 +7,101 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
-	var reportmin = 0
-	var devicemin = 0
-	if c.info != nil && c.info.Common != nil && c.info.Common.BaseConfig != nil {
-		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
-		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
+func (c *Controller) reportUserTrafficTask(ctx context.Context) error {
+	info := c.currentInfo()
+	reportMin, deviceMin := 0, 0
+	if info != nil && info.Common != nil && info.Common.BaseConfig != nil {
+		reportMin = info.Common.BaseConfig.NodeReportMinTraffic
+		deviceMin = info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
-	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
-	if len(userTraffic) > 0 {
-		stepCtx, cancel := panelRequestContext(ctx)
-		err = c.apiClient.ReportUserTraffic(stepCtx, userTraffic)
-		cancel()
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Info("Report user traffic failed")
-			if isPanelTimeout(err) {
-				return nil
+	var traffic []panel.UserTraffic
+	stepCtx, cancel := panelRequestContext(ctx)
+	defer cancel()
+	err := c.apiClient.FlushTrafficLimit(stepCtx, func() ([]panel.UserTraffic, error) {
+		var err error
+		traffic, err = c.server.GetUserTrafficSlice(c.tag, reportMin)
+		if err == nil {
+			small := map[int]bool{}
+			for _, row := range traffic {
+				if row.Upload+row.Download < int64(deviceMin)*1000 {
+					small[row.UID] = true
+				}
 			}
-		} else {
-			if commitErr := c.server.CommitUserTrafficSlice(c.tag, userTraffic); commitErr != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": commitErr,
-				}).Warn("Commit user traffic failed")
-				return commitErr
-			}
-			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
-			//log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
-			if hasPanelTaskBudget(ctx) {
-				_ = c.syncUsers(ctx)
-			}
+			c.onlineTrafficAccess.Lock()
+			c.onlineSmallTraffic = small
+			c.onlineTrafficAccess.Unlock()
 		}
-	} else {
-		stepCtx, cancel := panelRequestContext(ctx)
-		err = c.apiClient.ReportUserTraffic(stepCtx, userTraffic)
-		cancel()
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Debug("Report empty traffic heartbeat failed")
-			if isPanelTimeout(err) {
-				return nil
-			}
-		} else {
-			log.WithField("tag", c.tag).Debug("Report empty traffic heartbeat")
-		}
+		return traffic, err
+	}, func(rows []panel.UserTraffic) error {
+		return c.server.CommitUserTrafficSlice(c.tag, rows)
+	}, c.revokeReportedUsers, 200)
+	if err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("Traffic unconfirmed; retain pending batch and retry")
 	}
+	return nil
+}
 
-	if !hasPanelTaskBudget(ctx) {
-		log.WithField("tag", c.tag).Warn("Skip online device report because panel task budget is low")
+func (c *Controller) reportHeartbeat(ctx context.Context) error {
+	devices, err := c.limiter.GetOnlineDevice()
+	if err != nil {
+		log.WithError(err).Warn("Read online devices failed")
 		return nil
 	}
-
-	if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
-		log.WithFields(log.Fields{
-			"tag": c.tag,
-			"err": err,
-		}).Info("Get online device failed")
-	} else {
-		var result []panel.OnlineUser
-		var nocountUID = make(map[int]struct{})
-		totalOnline := 0
-		for _, traffic := range userTraffic {
-			total := traffic.Upload + traffic.Download
-			if total < int64(devicemin*1000) {
-				nocountUID[traffic.UID] = struct{}{}
+	c.onlineTrafficAccess.RLock()
+	small := c.onlineSmallTraffic
+	c.onlineTrafficAccess.RUnlock()
+	data := map[int][]string{}
+	if devices != nil {
+		for _, d := range *devices {
+			if !small[d.UID] {
+				data[d.UID] = append(data[d.UID], d.IP)
 			}
 		}
-		if onlineDevice != nil {
-			totalOnline = len(*onlineDevice)
-			for _, online := range *onlineDevice {
-				if _, ok := nocountUID[online.UID]; !ok {
-					result = append(result, online)
-				}
-			}
-		}
-		data := make(map[int][]string)
-		for _, onlineuser := range result {
-			// json structure: { UID1:["ip1","ip2"],UID2:["ip3","ip4"] }
-			data[onlineuser.UID] = append(data[onlineuser.UID], onlineuser.IP)
-		}
-		if len(data) != 0 {
-			if !hasPanelTaskBudget(ctx) {
-				log.WithField("tag", c.tag).Warn("Skip online users report because panel task budget is low")
-				return nil
-			}
-			stepCtx, cancel := panelRequestContext(ctx)
-			err := c.apiClient.ReportNodeOnlineUsers(stepCtx, &data)
-			cancel()
-			if err != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": err,
-				}).Info("Report online users failed")
-				if isPanelTimeout(err) {
-					return nil
-				}
-			}
-		}
-		log.WithField("tag", c.tag).Infof("Total %d online users, %d Reported", totalOnline, len(result))
 	}
+	stepCtx, cancel := panelRequestContext(ctx)
+	err = c.apiClient.ReportNodeOnlineUsers(stepCtx, &data)
+	cancel()
+	if err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("Online heartbeat unconfirmed")
+	}
+	if hasPanelTaskBudget(ctx) {
+		stepCtx, cancel := panelRequestContext(ctx)
+		alive, err := c.apiClient.GetUserAlive(stepCtx)
+		cancel()
+		if err == nil && alive != nil {
+			c.limiter.UpdateAliveList(alive)
+		}
+	}
+	// A transient reporting/storage failure must not terminate the recurring task.
+	return nil
+}
 
+func (c *Controller) revokeReportedUsers(ids []int) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	c.syncUsersAccess.Lock()
+	defer c.syncUsersAccess.Unlock()
+	c.userGeneration++
+	revoked := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		revoked[id] = true
+	}
+	kept := make([]panel.UserInfo, 0, len(c.userList))
+	deleted := make([]panel.UserInfo, 0, len(ids))
+	for _, u := range c.userList {
+		if revoked[u.Id] {
+			deleted = append(deleted, u)
+		} else {
+			kept = append(kept, u)
+		}
+	}
+	if err := c.server.DelUsers(deleted, c.tag, c.currentInfo()); err != nil {
+		return err
+	}
+	c.limiter.UpdateUser(c.tag, nil, deleted, nil)
+	c.userList = kept
+	c.apiClient.InvalidateUsers()
 	return nil
 }
 
@@ -120,7 +110,6 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 	for _, u := range old {
 		oldMap[u.Uuid] = u
 	}
-
 	for _, u := range new {
 		if o, ok := oldMap[u.Uuid]; !ok {
 			added = append(added, u)
@@ -131,10 +120,8 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 			delete(oldMap, u.Uuid)
 		}
 	}
-
 	for _, o := range oldMap {
 		deleted = append(deleted, o)
 	}
-
 	return deleted, added, modified
 }

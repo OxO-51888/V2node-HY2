@@ -1,65 +1,114 @@
 package panel
 
 import (
-	"errors"
+	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/OxO-51888/V2node-HY2/conf"
 	"github.com/go-resty/resty/v2"
 )
 
-// Panel is the interface for different panel's api.
+const contractVersion = "hy2-1"
+const apiPath = "/api/v2/server/hy2/"
+const maxResponseBytes = 16 << 20
 
 type Client struct {
-	client           *resty.Client
-	APIHost          string
-	Token            string
-	NodeId           int
-	nodeEtag         string
-	userEtag         string
-	responseBodyHash string
-	UserList         *UserListBody
-	AliveMap         *AliveMap
+	client                               *resty.Client
+	APIHost                              string
+	NodeId                               int
+	cacheMu                              sync.Mutex
+	nodeEtag, userEtag, responseBodyHash string
+	outboxMu                             sync.Mutex
+	outboxPath                           string
+	outbox                               *reportState
+	unsynced                             *reportState
+	syncDirectory                        func(string) error
+	recovered, committed                 bool
+	draining                             bool
+	drainSaved                           bool
+	drainBase                            []trafficRow
+	lastTrafficUID                       int
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {
-	client := resty.New()
-	retryCount := conf.DefaultNodeRetryCount
-	if c.RetryCount != nil {
-		retryCount = *c.RetryCount
+	u, err := url.Parse(c.APIHost)
+	if err != nil {
+		return nil, fmt.Errorf("invalid panel ApiHost")
 	}
-	client.SetRetryCount(retryCount)
-	client.SetHeader("User-Agent", fmt.Sprintf("v2node go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
-	if c.Timeout > 0 {
-		client.SetTimeout(time.Duration(c.Timeout) * time.Second)
-	} else {
-		client.SetTimeout(time.Duration(conf.DefaultNodeTimeout) * time.Second)
+	loopbackHTTP := u.Scheme == "http" && net.ParseIP(u.Hostname()).IsLoopback()
+	if (!loopbackHTTP && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return nil, fmt.Errorf("panel ApiHost must be an HTTPS origin without credentials or query")
 	}
-	client.OnError(func(req *resty.Request, err error) {
-		var v *resty.ResponseError
-		if errors.As(err, &v) {
-			// v.Response contains the last response from the server
-			// v.Err contains the original error
-			logrus.Error(v.Err)
+	if c.NodeID < 1 || c.Key == "" {
+		return nil, fmt.Errorf("panel NodeID and ApiKey are required")
+	}
+	client := resty.New().SetBaseURL(strings.TrimRight(c.APIHost, "/")).
+		SetAuthToken(c.Key).SetHeader("X-Node-ID", strconv.Itoa(c.NodeID)).
+		SetHeader("X-V2node-Contract", contractVersion).
+		SetHeader("Accept", "application/json").
+		SetHeader("User-Agent", "V2node-HY2/"+contractVersion).
+		SetRedirectPolicy(resty.NoRedirectPolicy()).SetRetryCount(0)
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = conf.DefaultNodeTimeout
+	}
+	client.SetTimeout(time.Duration(timeout) * time.Second)
+	dir := c.StateDirectory
+	if dir == "" {
+		dir = "/var/lib/v2node-hy2"
+	}
+	identity := sha256.Sum256([]byte(strings.TrimRight(c.APIHost, "/") + ":" + strconv.Itoa(c.NodeID)))
+	return &Client{client: client, APIHost: c.APIHost, NodeId: c.NodeID,
+		outboxPath: filepath.Join(dir, fmt.Sprintf("%x.json", identity[:16]))}, nil
+}
+
+// Bounded reads reject HTML login pages and incompatible panels instead of accepting them as ACKs.
+func (c *Client) request(ctx context.Context, method, action, etag string, body []byte) ([]byte, string, bool, error) {
+	rq := c.client.R().SetContext(ctx).SetDoNotParseResponse(true)
+	if etag != "" {
+		rq.SetHeader("If-None-Match", etag)
+	}
+	if body != nil {
+		rq.SetHeader("Content-Type", "application/json").SetBody(body)
+	}
+	r, err := rq.Execute(method, apiPath+action)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("panel %s transport: %w", action, err)
+	}
+	if r == nil || r.RawResponse == nil || r.RawResponse.Body == nil {
+		return nil, "", false, fmt.Errorf("panel %s: missing response", action)
+	}
+	defer r.RawResponse.Body.Close()
+	if r.StatusCode() != 200 && r.StatusCode() != 304 {
+		return nil, "", false, fmt.Errorf("panel %s: status %d", action, r.StatusCode())
+	}
+	if r.Header().Get("X-V2node-Contract") != contractVersion {
+		return nil, "", false, fmt.Errorf("panel %s: incompatible contract; install matching HY2 panel first", action)
+	}
+	if r.StatusCode() == 304 {
+		if method != "GET" || etag == "" {
+			return nil, "", false, fmt.Errorf("panel %s: unexpected 304", action)
 		}
-	})
-	client.SetBaseURL(c.APIHost)
-	// set params
-	client.SetQueryParams(map[string]string{
-		"node_type": "v2node",
-		"node_id":   strconv.Itoa(c.NodeID),
-		"token":     c.Key,
-	})
-	return &Client{
-		client:   client,
-		Token:    c.Key,
-		APIHost:  c.APIHost,
-		NodeId:   c.NodeID,
-		UserList: &UserListBody{},
-		AliveMap: &AliveMap{},
-	}, nil
+		return nil, etag, true, nil
+	}
+	if !strings.HasPrefix(strings.ToLower(r.Header().Get("Content-Type")), "application/json") {
+		return nil, "", false, fmt.Errorf("panel %s: expected JSON", action)
+	}
+	data, err := io.ReadAll(io.LimitReader(r.RawResponse.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, "", false, fmt.Errorf("panel %s body: %w", action, err)
+	}
+	if len(data) > maxResponseBytes {
+		return nil, "", false, fmt.Errorf("panel %s: response too large", action)
+	}
+	return data, r.Header().Get("ETag"), false, nil
 }

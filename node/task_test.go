@@ -32,13 +32,13 @@ func TestRequiresCoreReloadDetectsInboundChange(t *testing.T) {
 	}
 }
 
-func TestRequiresCoreReloadDetectsTrustedForwarderChange(t *testing.T) {
+func TestRequiresCoreReloadDetectsObfuscationChange(t *testing.T) {
 	oldNode := testNodeInfo()
 	newNode := testNodeInfo()
-	newNode.Common.TrustedXForwardedFor = []string{"203.0.113.0/24"}
+	newNode.Common.ObfsPassword = "changed"
 
 	if !requiresCoreReload(oldNode, newNode) {
-		t.Fatal("trusted X-Forwarded-For change should require core reload")
+		t.Fatal("obfuscation change should require core reload")
 	}
 }
 

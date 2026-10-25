@@ -22,3 +22,7 @@ func (v *V2Core) DelNode(tag string) error {
 	}
 	return nil
 }
+
+func (v *V2Core) QuiesceNode(tag string) error {
+	return v.hy2.QuiesceNode(tag)
+}

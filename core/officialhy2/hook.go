@@ -16,15 +16,22 @@ type trafficLogger struct {
 	logger    *zap.Logger
 	counter   *counter.TrafficCounter
 	users     sync.Map
+	cacheMu   sync.Mutex
 }
 
 type trafficUserCache struct {
-	storage *counter.TrafficStorage
-	limit   *limiter.UserLimitInfo
+	trafficMu sync.RWMutex
+	storage   *counter.TrafficStorage
+	limit     *limiter.UserLimitInfo
 }
 
 func (h *trafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	user := h.getUser(id)
+	if user == nil {
+		return false
+	}
+	user.trafficMu.RLock()
+	defer user.trafficMu.RUnlock()
 	if user == nil || user.limit == nil || user.limit.Revoked.Load() {
 		return false
 	}
@@ -40,33 +47,30 @@ func (h *trafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	return true
 }
 
-func (h *trafficLogger) LogOnlineState(_ string, _ bool) {}
-
+func (h *trafficLogger) LogOnlineState(_ string, _ bool)                      {}
 func (h *trafficLogger) TraceStream(_ server.HyStream, _ *server.StreamStats) {}
-
-func (h *trafficLogger) UntraceStream(_ server.HyStream) {}
-
-func (h *trafficLogger) TrackStreamStats() bool { return false }
-
-func (h *trafficLogger) ForgetUser(id string) {
-	h.users.Delete(id)
-}
+func (h *trafficLogger) UntraceStream(_ server.HyStream)                      {}
+func (h *trafficLogger) TrackStreamStats() bool                               { return false }
+func (h *trafficLogger) ForgetUser(id string)                                 { h.users.Delete(id) }
 
 func (h *trafficLogger) getUser(id string) *trafficUserCache {
 	if cached, ok := h.users.Load(id); ok {
 		user := cached.(*trafficUserCache)
 		if user.limit.Revoked.Load() {
-			h.users.CompareAndDelete(id, user)
 			return nil
 		}
 		return user
+	}
+	h.cacheMu.Lock()
+	defer h.cacheMu.Unlock()
+	if cached, ok := h.users.Load(id); ok {
+		return cached.(*trafficUserCache)
 	}
 	limiterInfo, err := h.getLimiter()
 	if err != nil {
 		h.logger.Error("get limiter error", zap.String("tag", h.tag), zap.Error(err))
 		return nil
 	}
-
 	var userLimitInfo *limiter.UserLimitInfo
 	if userLimit, ok := limiterInfo.UserLimitInfo.Load(h.userTag(id)); ok {
 		userLimitInfo = userLimit.(*limiter.UserLimitInfo)
@@ -74,10 +78,7 @@ func (h *trafficLogger) getUser(id string) *trafficUserCache {
 	if userLimitInfo == nil || userLimitInfo.Revoked.Load() {
 		return nil
 	}
-	user := &trafficUserCache{
-		storage: h.counter.GetCounter(id),
-		limit:   userLimitInfo,
-	}
+	user := &trafficUserCache{storage: h.counter.GetCounter(id), limit: userLimitInfo}
 	actual, _ := h.users.LoadOrStore(id, user)
 	return actual.(*trafficUserCache)
 }
@@ -88,7 +89,6 @@ func (h *trafficLogger) getLimiter() (*limiter.Limiter, error) {
 	}
 	return limiter.GetLimiter(h.tag)
 }
-
 func (h *trafficLogger) userTag(uuid string) string {
 	if h.tagPrefix != "" {
 		return h.tagPrefix + uuid

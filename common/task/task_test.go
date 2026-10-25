@@ -73,3 +73,61 @@ func TestTimeoutKeepsExecutionLockUntilWorkerReturns(t *testing.T) {
 		t.Fatalf("started after first worker returned = %d, want 2", got)
 	}
 }
+
+func TestCloseCancelsAndJoinsWorker(t *testing.T) {
+	started, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	tk := &Task{Interval: time.Hour, Timeout: time.Hour, Execute: func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		close(cancelled)
+		<-release
+		return ctx.Err()
+	}}
+	if err := tk.Start(true); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	done := make(chan error, 1)
+	go func() { done <- tk.CloseContext(context.Background()) }()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("worker not cancelled")
+	}
+	select {
+	case <-done:
+		t.Fatal("close returned before worker exit")
+	default:
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not finish")
+	}
+	if err := tk.ExecuteWithTimeout(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.Start(true); err == nil {
+		t.Fatal("closed task restarted")
+	}
+}
+
+func TestCloseTimeoutDoesNotPretendWorkerStopped(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	tk := &Task{Interval: time.Hour, Execute: func(context.Context) error { close(started); <-release; return nil }}
+	_ = tk.Start(true)
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if tk.CloseContext(ctx) == nil {
+		t.Fatal("blocked worker accepted as stopped")
+	}
+	close(release)
+	if err := tk.CloseContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	panel "github.com/OxO-51888/V2node-HY2/api/v2board"
@@ -16,6 +17,12 @@ type Node struct {
 	configs     []conf.NodeConfig
 	stopCh      chan struct{}
 	NodeInfos   []*panel.NodeInfo
+	access      sync.Mutex
+	starters    sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	closed      bool
+	started     bool
 }
 
 func New(nodes []conf.NodeConfig) (*Node, error) {
@@ -59,29 +66,39 @@ func New(nodes []conf.NodeConfig) (*Node, error) {
 }
 
 func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
+	n.access.Lock()
+	defer n.access.Unlock()
+	if n.closed {
+		return fmt.Errorf("node manager closed")
+	}
+	if n.started {
+		return nil
+	}
+	n.started = true
+	n.ctx, n.cancel = context.WithCancel(context.Background())
 	if len(n.configs) == 0 {
 		n.configs = nodes
 	}
 	for i := range n.controllers {
 		node := n.configs[i]
 		controller := n.controllers[i]
-		go startControllerWithRetry(n.stopCh, controller, node, core)
+		n.starters.Add(1)
+		go func() { defer n.starters.Done(); startControllerWithRetry(n.ctx, controller, node, core) }()
 	}
 	return nil
 }
 
-func startControllerWithRetry(stopCh <-chan struct{}, controller *Controller, node conf.NodeConfig, core *core.V2Core) {
+func startControllerWithRetry(ctx context.Context, controller *Controller, node conf.NodeConfig, core *core.V2Core) {
 	for {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		default:
 		}
-		err := controller.Start(core)
+		err := controller.StartContext(ctx, core)
 		if err == nil {
 			select {
-			case <-stopCh:
-				_ = controller.Close()
+			case <-ctx.Done():
 				return
 			default:
 			}
@@ -97,7 +114,7 @@ func startControllerWithRetry(stopCh <-chan struct{}, controller *Controller, no
 			"err": err,
 		}).Error("Start node controller failed, retrying")
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		case <-time.After(30 * time.Second):
 		}
@@ -105,10 +122,22 @@ func startControllerWithRetry(stopCh <-chan struct{}, controller *Controller, no
 }
 
 func (n *Node) Close() error {
+	n.access.Lock()
+	defer n.access.Unlock()
 	var err error
-	if n.stopCh != nil {
-		close(n.stopCh)
-		n.stopCh = nil
+	n.closed = true
+	if n.cancel != nil {
+		n.cancel()
+	}
+	joined := make(chan struct{})
+	go func() { n.starters.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("node startup did not stop; core retained")
+	}
+	for _, c := range n.controllers {
+		c.cancelTasks()
 	}
 	for _, c := range n.controllers {
 		if err = c.Close(); err != nil {

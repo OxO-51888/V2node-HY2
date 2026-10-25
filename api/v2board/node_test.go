@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,19 +14,22 @@ import (
 
 func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, func()) {
 	t.Helper()
-	server := httptest.NewServer(handler)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, apiPath) {
+			t.Errorf("legacy request: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-V2node-Contract", contractVersion)
+		handler(w, r)
+	}))
 	client := resty.New().
 		SetBaseURL(server.URL).
-		SetQueryParams(map[string]string{
-			"node_type": "v2node",
-			"node_id":   "1",
-			"token":     "test",
-		})
+		SetAuthToken("test").SetHeader("X-Node-ID", "1").SetHeader("X-V2node-Contract", contractVersion)
 	return &Client{
-		client:  client,
-		APIHost: server.URL,
-		Token:   "test",
-		NodeId:  1,
+		client:     client,
+		APIHost:    server.URL,
+		NodeId:     1,
+		outboxPath: filepath.Join(t.TempDir(), "traffic.json"),
 	}, server.Close
 }
 
@@ -42,7 +46,7 @@ func TestGetNodeInfoRejectsInitialEmptyResponse(t *testing.T) {
 	}
 }
 
-func TestGetNodeInfoSkipsEmptyCachedResponse(t *testing.T) {
+func TestGetNodeInfoRejectsEmptyCachedResponse(t *testing.T) {
 	client, closeServer := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -51,11 +55,8 @@ func TestGetNodeInfoSkipsEmptyCachedResponse(t *testing.T) {
 	client.responseBodyHash = "cached"
 
 	info, err := client.GetNodeInfo(context.Background())
-	if err != nil {
-		t.Fatalf("GetNodeInfo() error = %v", err)
-	}
-	if info != nil {
-		t.Fatalf("GetNodeInfo() = %#v, want nil cached skip", info)
+	if err == nil || info != nil {
+		t.Fatal("empty response silently accepted")
 	}
 }
 
@@ -68,8 +69,40 @@ func TestGetNodeInfoRejectsServerError(t *testing.T) {
 	defer closeServer()
 
 	_, err := client.GetNodeInfo(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "get node info: status 500") {
+	if err == nil || !strings.Contains(err.Error(), "status 500") {
 		t.Fatalf("GetNodeInfo() error = %v, want status 500 error", err)
+	}
+}
+
+func TestNodeCacheOnlyCommittedAfterApply(t *testing.T) {
+	c, closeServer := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `W/"node1"`)
+		w.Write([]byte(`{"protocol":"hysteria2","server_port":443,"tls":1}`))
+	})
+	defer closeServer()
+	first, err := c.GetNodeInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.GetNodeInfo(context.Background())
+	if err != nil || second == nil {
+		t.Fatal("unapplied config was hidden")
+	}
+	c.CommitNodeInfo(first)
+	third, err := c.GetNodeInfo(context.Background())
+	if err != nil || third != nil {
+		t.Fatal("applied hash not cached")
+	}
+}
+
+func TestNodeValidationDoesNotPoisonCache(t *testing.T) {
+	for _, body := range []string{`{"protocol":"vless","server_port":443}`, `{"protocol":"hysteria2","server_port":0}`, `{"status":"fail"}`, `null`} {
+		c, closeServer := newTestClient(t, func(w http.ResponseWriter, r *http.Request) { w.Header().Set("ETag", "bad"); w.Write([]byte(body)) })
+		_, err := c.GetNodeInfo(context.Background())
+		closeServer()
+		if err == nil || c.nodeEtag != "" || c.responseBodyHash != "" {
+			t.Fatalf("bad config accepted: %s", body)
+		}
 	}
 }
 

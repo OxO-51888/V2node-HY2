@@ -179,8 +179,7 @@ func (m *Manager) DelUsers(tag string, users []panel.UserInfo) error {
 		if limit, err := n.traffic.getLimiter(); err == nil {
 			limit.RevokeUser(n.traffic.userTag(user.Uuid))
 		}
-		n.traffic.counter.Delete(user.Uuid)
-		n.traffic.ForgetUser(user.Uuid)
+		n.traffic.settleUser(user.Uuid)
 	}
 	return nil
 }
@@ -194,12 +193,15 @@ func (m *Manager) GetUserTrafficSlice(tag string, minTraffic int, uidForUUID fun
 	}
 
 	var trafficSlice []panel.UserTraffic
+	n.auth.mu.RLock()
+	defer n.auth.mu.RUnlock()
 	n.traffic.counter.Counters.Range(func(key, value interface{}) bool {
 		uuid := key.(string)
 		traffic := value.(*counter.TrafficStorage)
 		up := traffic.UpCounter.Load()
 		down := traffic.DownCounter.Load()
-		if up+down <= int64(minTraffic*1000) {
+		_, active := n.auth.users[uuid]
+		if up+down == 0 || (active && up+down <= int64(minTraffic*1000)) {
 			return true
 		}
 

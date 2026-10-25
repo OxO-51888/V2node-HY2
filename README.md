@@ -4,6 +4,13 @@ HY2-only V2Board backend built around the official Hysteria2 server core.
 
 This branch removes the Xray-core runtime path and only accepts `hysteria2` nodes.
 
+## Panel Compatibility
+
+This version requires the dedicated `hy2-1` panel API and its database migration.
+It does not fall back to UniProxy or the generic V2 server API. Upgrade the panel
+and backend as one coordinated release; do not install this candidate against an
+unmodified panel. See [the API contract](docs/panel-contract.md).
+
 ## UDP Receive Buffer
 
 Each HY2 listener requests a 32 MiB socket receive buffer before QUIC starts.

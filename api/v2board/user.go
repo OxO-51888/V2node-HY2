@@ -2,157 +2,109 @@ package panel
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"strings"
-
 	"encoding/json/v2"
-
-	"github.com/vmihailenco/msgpack/v5"
+	"fmt"
 )
 
 type OnlineUser struct {
 	UID int
 	IP  string
 }
-
 type UserInfo struct {
-	Id          int    `json:"id" msgpack:"id"`
-	Uuid        string `json:"uuid" msgpack:"uuid"`
-	SpeedLimit  int    `json:"speed_limit" msgpack:"speed_limit"`
-	DeviceLimit int    `json:"device_limit" msgpack:"device_limit"`
+	Id          int    `json:"id"`
+	Uuid        string `json:"uuid"`
+	SpeedLimit  int    `json:"speed_limit"`
+	DeviceLimit int    `json:"device_limit"`
+}
+type UserSnapshot struct {
+	Users []UserInfo `json:"users"`
+	ETag  string     `json:"-"`
+}
+type UserTraffic struct {
+	UID              int
+	Upload, Download int64
+	UUID             string `json:"-"`
 }
 
-type UserListBody struct {
-	Users []UserInfo `json:"users" msgpack:"users"`
+func (c *Client) GetUsers(ctx context.Context) (*UserSnapshot, error) {
+	c.cacheMu.Lock()
+	etag := c.userEtag
+	c.cacheMu.Unlock()
+	body, next, unchanged, err := c.request(ctx, "GET", "users", etag, nil)
+	if err != nil || unchanged {
+		return nil, err
+	}
+	var snapshot UserSnapshot
+	if err = json.Unmarshal(body, &snapshot); err != nil {
+		return nil, fmt.Errorf("decode users: %w", err)
+	}
+	if snapshot.Users == nil {
+		return nil, fmt.Errorf("missing or null users array")
+	}
+	ids := make(map[int]bool, len(snapshot.Users))
+	uuids := make(map[string]bool, len(snapshot.Users))
+	for _, u := range snapshot.Users {
+		if u.Id <= 0 || u.Uuid == "" || u.SpeedLimit < 0 || u.DeviceLimit < 0 || ids[u.Id] || uuids[u.Uuid] {
+			return nil, fmt.Errorf("invalid or duplicate user")
+		}
+		ids[u.Id] = true
+		uuids[u.Uuid] = true
+	}
+	snapshot.ETag = next
+	return &snapshot, nil
 }
 
-type AliveMap struct {
-	Alive map[int]int `json:"alive"`
+func (c *Client) CommitUsers(snapshot *UserSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	c.cacheMu.Lock()
+	c.userEtag = snapshot.ETag
+	c.cacheMu.Unlock()
 }
 
-// GetUserList will pull user from v2board
-func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
-	const path = "/api/v1/server/UniProxy/user"
-	r, err := c.client.R().
-		SetContext(ctx).
-		SetHeader("If-None-Match", c.userEtag).
-		SetHeader("X-Response-Format", "msgpack").
-		SetDoNotParseResponse(true).
-		Get(path)
+func (c *Client) InvalidateUsers() {
+	c.cacheMu.Lock()
+	c.userEtag = ""
+	c.cacheMu.Unlock()
+}
+
+func (c *Client) GetUserAlive(ctx context.Context) (map[int]int, error) {
+	body, _, _, err := c.request(ctx, "GET", "alive", "", nil)
 	if err != nil {
 		return nil, err
 	}
-	if r == nil || r.RawResponse == nil {
-		return nil, fmt.Errorf("received nil response or raw response")
+	var data struct {
+		Alive map[int]int `json:"alive"`
 	}
-	defer r.RawResponse.Body.Close()
-
-	if r.StatusCode() == 304 {
-		return nil, nil
+	if err = json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("decode alive: %w", err)
 	}
-	if r.StatusCode() != 200 {
-		return nil, fmt.Errorf("get user list: status %d", r.StatusCode())
+	if data.Alive == nil {
+		return nil, fmt.Errorf("missing alive object")
 	}
-	userlist := &UserListBody{}
-	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
-		decoder := msgpack.NewDecoder(r.RawResponse.Body)
-		if err := decoder.Decode(userlist); err != nil {
-			return nil, fmt.Errorf("decode user list error: %w", err)
-		}
-	} else {
-		if err := json.UnmarshalRead(r.RawResponse.Body, userlist); err != nil {
-			return nil, fmt.Errorf("decode user list error: %w", err)
+	for uid, n := range data.Alive {
+		if uid <= 0 || n < 0 {
+			return nil, fmt.Errorf("invalid alive count")
 		}
 	}
-	if userlist.Users == nil {
-		return nil, fmt.Errorf("decode user list error: missing or null users array")
-	}
-	c.userEtag = r.Header().Get("ETag")
-	return userlist.Users, nil
-}
-
-// GetUserAlive will fetch the alive_ip count for users
-func (c *Client) GetUserAlive(ctx context.Context) (map[int]int, error) {
-	c.AliveMap = &AliveMap{}
-	const path = "/api/v1/server/UniProxy/alivelist"
-	r, err := c.client.R().
-		SetContext(ctx).
-		ForceContentType("application/json").
-		Get(path)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
-		}
-		c.AliveMap.Alive = make(map[int]int)
-		return c.AliveMap.Alive, nil
-	}
-	if r == nil || r.RawResponse == nil || r.StatusCode() >= 399 {
-		c.AliveMap.Alive = make(map[int]int)
-		return c.AliveMap.Alive, nil
-	}
-	defer r.RawResponse.Body.Close()
-	if err := json.Unmarshal(r.Body(), c.AliveMap); err != nil {
-		fmt.Printf("unmarshal user alive list error: %s", err)
-		c.AliveMap.Alive = make(map[int]int)
-	}
-	if c.AliveMap.Alive == nil {
-		c.AliveMap.Alive = make(map[int]int)
-	}
-
-	return c.AliveMap.Alive, nil
-}
-
-type UserTraffic struct {
-	UID      int
-	Upload   int64
-	Download int64
-	UUID     string `json:"-" msgpack:"-"`
-}
-
-// ReportUserTraffic reports the user traffic
-func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffic) error {
-	data := make(map[int][]int64, len(userTraffic))
-	for i := range userTraffic {
-		data[userTraffic[i].UID] = []int64{userTraffic[i].Upload, userTraffic[i].Download}
-	}
-	const path = "/api/v1/server/UniProxy/push"
-	r, err := c.client.R().
-		SetContext(ctx).
-		SetBody(data).
-		ForceContentType("application/json").
-		Post(path)
-	if err != nil {
-		return err
-	}
-	code := 0
-	if r != nil {
-		code = r.StatusCode()
-	}
-	if code == 0 || code >= 400 {
-		return fmt.Errorf("report user traffic failed with status %d", code)
-	}
-	return nil
+	return data.Alive, nil
 }
 
 func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]string) error {
-	const path = "/api/v1/server/UniProxy/alive"
-	r, err := c.client.R().
-		SetContext(ctx).
-		SetBody(data).
-		ForceContentType("application/json").
-		Post(path)
-
+	body, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
-	code := 0
-	if r != nil {
-		code = r.StatusCode()
+	body, _, _, err = c.request(ctx, "POST", "alive", "", body)
+	if err != nil {
+		return err
 	}
-	if code == 0 || code >= 400 {
-		return fmt.Errorf("report online users failed with status %d", code)
+	var ack struct {
+		Accepted bool `json:"accepted"`
 	}
-
+	if json.Unmarshal(body, &ack) != nil || !ack.Accepted {
+		return fmt.Errorf("online report was not acknowledged")
+	}
 	return nil
 }

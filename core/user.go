@@ -16,9 +16,11 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 			return err
 		}
 	}
-	for i := range users {
-		delete(vc.users.uidMap, format.UserTag(tag, users[i].Uuid))
+	uuids := make([]string, 0, len(users))
+	for _, user := range users {
+		uuids = append(uuids, user.Uuid)
 	}
+	vc.pruneRetiredTraffic(tag, uuids)
 	return nil
 }
 
@@ -39,11 +41,24 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 }
 
 func (vc *V2Core) CommitUserTrafficSlice(tag string, reported []panel.UserTraffic) error {
+	vc.users.mapLock.Lock()
+	defer vc.users.mapLock.Unlock()
 	if len(reported) == 0 || !vc.hy2.HasNode(tag) {
 		return nil
 	}
 	vc.hy2.CommitUserTraffic(tag, reported)
+	uuids := make([]string, 0, len(reported))
+	for _, row := range reported {
+		uuids = append(uuids, row.UUID)
+	}
+	vc.pruneRetiredTraffic(tag, uuids)
 	return nil
+}
+
+func (vc *V2Core) pruneRetiredTraffic(tag string, uuids []string) {
+	for _, uuid := range vc.hy2.PruneRetiredUsers(tag, uuids) {
+		delete(vc.users.uidMap, format.UserTag(tag, uuid))
+	}
 }
 
 func (vc *V2Core) CommitUserTraffic(tag string, reported []panel.UserTraffic) {

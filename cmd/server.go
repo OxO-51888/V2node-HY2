@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/OxO-51888/V2node-HY2/conf"
 	"github.com/OxO-51888/V2node-HY2/core"
@@ -77,7 +78,13 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.WithField("err", err).Error("Start core failed")
 		return
 	}
-	defer v2core.Close()
+	defer func() {
+		if err := nodes.Close(); err != nil {
+			log.WithError(err).Error("Shutdown incomplete; accounting state retained")
+			return
+		}
+		_ = v2core.Close()
+	}()
 
 	if err := nodes.Start(c.NodeConfigs, v2core); err != nil {
 		log.WithField("err", err).Error("Run nodes failed")
@@ -101,12 +108,23 @@ func serverHandle(_ *cobra.Command, _ []string) {
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(osSignals)
 
 	for {
 		select {
 		case <-osSignals:
 			log.Info("received exit signal, shutting down")
-			os.Exit(0)
+			if err := nodes.Close(); err != nil {
+				log.WithError(err).Error("Final accounting not durable; retaining runtime and retrying shutdown")
+				time.AfterFunc(5*time.Second, func() {
+					select {
+					case osSignals <- syscall.SIGTERM:
+					default:
+					}
+				})
+				continue
+			}
+			return
 		case <-reloadCh:
 			log.Info("reload requested")
 			if err := reload(config, &nodes, &v2core); err != nil {
@@ -143,6 +161,7 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	}
 
 	if err := oldNodes.Close(); err != nil {
+		_ = newCore.Close()
 		return fmt.Errorf("close old nodes: %w", err)
 	}
 	if err := oldCore.Close(); err != nil {

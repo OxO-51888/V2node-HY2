@@ -35,11 +35,16 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 		ExitOnTimeout:      true,
 		ExitOnTimeoutAfter: 3,
 	}
+	c.heartbeatPeriodic = &task.Task{
+		Name: "onlineHeartbeat", Interval: node.PushInterval, Execute: c.reportHeartbeat,
+		ReloadCh: c.server.ReloadCh, Timeout: panelTaskTimeout,
+	}
 	log.WithField("tag", c.tag).Info("Start monitor node status")
 	// delay to start nodeInfoMonitor
 	_ = c.nodeInfoMonitorPeriodic.Start(false)
 	log.WithField("tag", c.tag).Info("Start report node status")
 	_ = c.userReportPeriodic.Start(false)
+	_ = c.heartbeatPeriodic.Start(false)
 	if node.Security == panel.Tls {
 		switch c.info.Common.CertInfo.CertMode {
 		case "none", "", "file", "self", "remote":
@@ -77,10 +82,10 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		return nil
 	}
 	if newN != nil {
-		if requiresCoreReload(c.info, newN) {
+		if requiresCoreReload(c.currentInfo(), newN) {
 			log.WithFields(log.Fields{
 				"tag":     c.tag,
-				"changes": strings.Join(coreReloadReasons(c.info, newN), ","),
+				"changes": strings.Join(coreReloadReasons(c.currentInfo(), newN), ","),
 			}).Warn("Got core node info change, reload")
 			c.requestReload()
 			return nil
@@ -94,11 +99,14 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 }
 
 func (c *Controller) syncUsers(ctx context.Context) (err error) {
+	c.userFetchAccess.Lock()
+	defer c.userFetchAccess.Unlock()
 	c.syncUsersAccess.Lock()
-	defer c.syncUsersAccess.Unlock()
+	generation := c.userGeneration
+	c.syncUsersAccess.Unlock()
 
 	stepCtx, cancel := panelRequestContext(ctx)
-	newU, err := c.apiClient.GetUserList(stepCtx)
+	snapshot, err := c.apiClient.GetUsers(stepCtx)
 	cancel()
 	if err != nil {
 		if isPanelTimeout(err) {
@@ -114,39 +122,22 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 		}).Error("Get user list failed")
 		return nil
 	}
-	// get user alive
-	stepCtx, cancel = panelRequestContext(ctx)
-	newA, err := c.apiClient.GetUserAlive(stepCtx)
-	cancel()
-	if err != nil {
-		if isPanelTimeout(err) {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Warn("Get alive list timed out, continue without alive update")
-			newA = nil
-		} else {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("Get alive list failed")
-			return nil
-		}
-	}
-
-	// update alive list
-	if newA != nil {
-		c.limiter.UpdateAliveList(newA)
+	c.syncUsersAccess.Lock()
+	defer c.syncUsersAccess.Unlock()
+	if generation != c.userGeneration {
+		c.apiClient.InvalidateUsers()
+		return nil
 	}
 	// node no changed, check users
-	if newU == nil {
+	if snapshot == nil {
 		log.WithField("tag", c.tag).Debug("User list no change")
 		return nil
 	}
+	newU := snapshot.Users
 	deleted, added, modified := compareUserList(c.userList, newU)
 	if len(deleted) > 0 {
 		// have deleted users
-		err = c.server.DelUsers(deleted, c.tag, c.info)
+		err = c.server.DelUsers(deleted, c.tag, c.currentInfo())
 		if err != nil {
 			log.WithFields(log.Fields{
 				"tag": c.tag,
@@ -159,7 +150,7 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 		// have added users
 		_, err = c.server.AddUsers(&vCore.AddUsersParams{
 			Tag:      c.tag,
-			NodeInfo: c.info,
+			NodeInfo: c.currentInfo(),
 			Users:    added,
 		})
 		if err != nil {
@@ -175,6 +166,7 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 		c.limiter.UpdateUser(c.tag, added, deleted, modified)
 	}
 	c.userList = newU
+	c.apiClient.CommitUsers(snapshot)
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	return nil
 }
@@ -213,7 +205,13 @@ func (c *Controller) applyRuntimeNodeInfo(node *panel.NodeInfo) {
 	if c.userReportPeriodic != nil {
 		c.userReportPeriodic.UpdateInterval(node.PushInterval)
 	}
+	if c.heartbeatPeriodic != nil {
+		c.heartbeatPeriodic.UpdateInterval(node.PushInterval)
+	}
+	c.infoAccess.Lock()
 	c.info = node
+	c.infoAccess.Unlock()
+	c.apiClient.CommitNodeInfo(node)
 }
 
 func requiresCoreReload(oldNode, newNode *panel.NodeInfo) bool {
@@ -245,18 +243,6 @@ func coreReloadReasons(oldNode, newNode *panel.NodeInfo) []string {
 	appendIfChanged("routes", oldFp.Common.Routes, newFp.Common.Routes)
 	appendIfChanged("tls", oldFp.Common.Tls, newFp.Common.Tls)
 	appendIfChanged("tls_settings", oldFp.Common.TlsSettings, newFp.Common.TlsSettings)
-	appendIfChanged("network", oldFp.Common.Network, newFp.Common.Network)
-	appendIfChanged("network_settings", oldFp.Common.NetworkSettings, newFp.Common.NetworkSettings)
-	appendIfChanged("trusted_x_forwarded_for", oldFp.Common.TrustedXForwardedFor, newFp.Common.TrustedXForwardedFor)
-	appendIfChanged("encryption", oldFp.Common.Encryption, newFp.Common.Encryption)
-	appendIfChanged("encryption_settings", oldFp.Common.EncryptionSettings, newFp.Common.EncryptionSettings)
-	appendIfChanged("server_name", oldFp.Common.ServerName, newFp.Common.ServerName)
-	appendIfChanged("flow", oldFp.Common.Flow, newFp.Common.Flow)
-	appendIfChanged("cipher", oldFp.Common.Cipher, newFp.Common.Cipher)
-	appendIfChanged("server_key", oldFp.Common.ServerKey, newFp.Common.ServerKey)
-	appendIfChanged("congestion_control", oldFp.Common.CongestionControl, newFp.Common.CongestionControl)
-	appendIfChanged("zero_rtt_handshake", oldFp.Common.ZeroRTTHandshake, newFp.Common.ZeroRTTHandshake)
-	appendIfChanged("padding_scheme", oldFp.Common.PaddingScheme, newFp.Common.PaddingScheme)
 	appendIfChanged("up_mbps", oldFp.Common.UpMbps, newFp.Common.UpMbps)
 	appendIfChanged("down_mbps", oldFp.Common.DownMbps, newFp.Common.DownMbps)
 	appendIfChanged("obfs", oldFp.Common.Obfs, newFp.Common.Obfs)
@@ -283,18 +269,6 @@ type commonCoreFingerprint struct {
 	Routes                []panel.Route
 	Tls                   int
 	TlsSettings           panel.TlsSettings
-	Network               string
-	NetworkSettings       []byte
-	TrustedXForwardedFor  []string
-	Encryption            string
-	EncryptionSettings    panel.EncSettings
-	ServerName            string
-	Flow                  string
-	Cipher                string
-	ServerKey             string
-	CongestionControl     string
-	ZeroRTTHandshake      bool
-	PaddingScheme         []string
 	UpMbps                int
 	DownMbps              int
 	Obfs                  string
@@ -320,18 +294,6 @@ func coreReloadFingerprint(node *panel.NodeInfo) nodeCoreFingerprint {
 		Routes:                common.Routes,
 		Tls:                   common.Tls,
 		TlsSettings:           common.TlsSettings,
-		Network:               common.Network,
-		NetworkSettings:       []byte(common.NetworkSettings),
-		TrustedXForwardedFor:  common.TrustedXForwardedFor,
-		Encryption:            common.Encryption,
-		EncryptionSettings:    common.EncryptionSettings,
-		ServerName:            common.ServerName,
-		Flow:                  common.Flow,
-		Cipher:                common.Cipher,
-		ServerKey:             common.ServerKey,
-		CongestionControl:     common.CongestionControl,
-		ZeroRTTHandshake:      common.ZeroRTTHandshake,
-		PaddingScheme:         common.PaddingScheme,
 		UpMbps:                common.UpMbps,
 		DownMbps:              common.DownMbps,
 		Obfs:                  common.Obfs,

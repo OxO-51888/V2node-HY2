@@ -16,47 +16,30 @@ import (
 
 // Security type
 const (
-	None    = 0
-	Tls     = 1
-	Reality = 2
+	None = 0
+	Tls  = 1
 )
 
 type NodeInfo struct {
-	Id           int
-	Type         string
-	Security     int
-	PushInterval time.Duration
-	PullInterval time.Duration
-	Tag          string
-	Common       *CommonNode
+	etag, bodyHash string
+	Id             int
+	Type           string
+	Security       int
+	PushInterval   time.Duration
+	PullInterval   time.Duration
+	Tag            string
+	Common         *CommonNode
 }
 
 type CommonNode struct {
-	Protocol   string      `json:"protocol"`
-	ListenIP   string      `json:"listen_ip"`
-	ServerPort int         `json:"server_port"`
-	Routes     []Route     `json:"routes"`
-	BaseConfig *BaseConfig `json:"base_config"`
-	//vless vmess trojan
-	Tls                  int         `json:"tls"`
-	TlsSettings          TlsSettings `json:"tls_settings"`
-	CertInfo             *CertInfo
-	Network              string          `json:"network"`
-	NetworkSettings      json.RawMessage `json:"network_settings"`
-	TrustedXForwardedFor []string        `json:"trusted_x_forwarded_for"`
-	Encryption           string          `json:"encryption"`
-	EncryptionSettings   EncSettings     `json:"encryption_settings"`
-	ServerName           string          `json:"server_name"`
-	Flow                 string          `json:"flow"`
-	//shadowsocks
-	Cipher    string `json:"cipher"`
-	ServerKey string `json:"server_key"`
-	//tuic
-	CongestionControl string `json:"congestion_control"`
-	ZeroRTTHandshake  bool   `json:"zero_rtt_handshake"`
-	//anytls
-	PaddingScheme []string `json:"padding_scheme,omitempty"`
-	//hysteria hysteria2
+	Protocol                string      `json:"protocol"`
+	ListenIP                string      `json:"listen_ip"`
+	ServerPort              int         `json:"server_port"`
+	Routes                  []Route     `json:"routes"`
+	BaseConfig              *BaseConfig `json:"base_config"`
+	Tls                     int         `json:"tls"`
+	TlsSettings             TlsSettings `json:"tls_settings"`
+	CertInfo                *CertInfo
 	UpMbps                  int    `json:"up_mbps"`
 	DownMbps                int    `json:"down_mbps"`
 	Obfs                    string `json:"obfs"`
@@ -87,13 +70,6 @@ const (
 type TlsSettings struct {
 	ServerName       string   `json:"server_name"`
 	ServerNames      []string `json:"server_names"`
-	Dest             string   `json:"dest"`
-	ServerPort       string   `json:"server_port"`
-	ShortId          string   `json:"short_id"`
-	ShortIds         []string `json:"short_ids"`
-	PrivateKey       string   `json:"private_key"`
-	Mldsa65Seed      string   `json:"mldsa65Seed"`
-	Xver             uint64   `json:"xver,string"`
 	CertMode         string   `json:"cert_mode"`
 	CertFile         string   `json:"cert_file"`
 	KeyFile          string   `json:"key_file"`
@@ -117,60 +93,24 @@ type CertInfo struct {
 	RejectUnknownSni bool
 }
 
-type EncSettings struct {
-	Mode          string `json:"mode"`
-	Ticket        string `json:"ticket"`
-	ServerPadding string `json:"server_padding"`
-	PrivateKey    string `json:"private_key"`
-}
-
 func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
-	const path = "/api/v2/server/config"
-	r, err := c.client.
-		R().
-		SetContext(ctx).
-		SetHeader("If-None-Match", c.nodeEtag).
-		ForceContentType("application/json").
-		Get(path)
-	if err != nil {
+	c.cacheMu.Lock()
+	etag, appliedHash := c.nodeEtag, c.responseBodyHash
+	c.cacheMu.Unlock()
+	body, nextEtag, unchanged, err := c.request(ctx, "GET", "config", etag, nil)
+	if err != nil || unchanged {
 		return nil, err
 	}
-	if r == nil {
-		return nil, fmt.Errorf("received nil response")
-	}
-
-	if r.StatusCode() == 304 {
-		return nil, nil
-	}
-	if r.StatusCode() >= 400 {
-		return nil, fmt.Errorf("get node info: status %d", r.StatusCode())
-	}
-	body := r.Body()
 	if len(bytes.TrimSpace(body)) == 0 {
-		if c.responseBodyHash != "" || c.nodeEtag != "" {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("empty node params response, status code: %d", r.StatusCode())
+		return nil, fmt.Errorf("empty node params response")
 	}
 	hash := sha256.Sum256(body)
 	newBodyHash := hex.EncodeToString(hash[:])
-	if c.responseBodyHash == newBodyHash {
+	if appliedHash == newBodyHash {
 		return nil, nil
 	}
-	c.responseBodyHash = newBodyHash
-	c.nodeEtag = r.Header().Get("ETag")
-
-	if r != nil {
-		defer func() {
-			if r.RawBody() != nil {
-				r.RawBody().Close()
-			}
-		}()
-	} else {
-		return nil, fmt.Errorf("received nil response")
-	}
 	node = &NodeInfo{
-		Id: c.NodeId,
+		Id: c.NodeId, etag: nextEtag, bodyHash: newBodyHash,
 	}
 	// parse protocol params
 	cm := &CommonNode{}
@@ -179,14 +119,14 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		return nil, fmt.Errorf("decode node params error: %s", err)
 	}
 	switch cm.Protocol {
-	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
+	case "hysteria2":
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
-	case "shadowsocks":
-		node.Type = cm.Protocol
-		node.Security = 0
 	default:
 		return nil, fmt.Errorf("unsupport protocol: %s", cm.Protocol)
+	}
+	if cm.ServerPort < 1 || cm.ServerPort > 65535 || cm.UpMbps < 0 || cm.DownMbps < 0 {
+		return nil, fmt.Errorf("invalid HY2 port or bandwidth")
 	}
 	node.Tag = fmt.Sprintf("[%s]-%s:%d", c.APIHost, node.Type, node.Id)
 	cf := cm.TlsSettings.CertFile
@@ -235,6 +175,15 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	node.Common = cm
 
 	return node, nil
+}
+
+func (c *Client) CommitNodeInfo(node *NodeInfo) {
+	if node == nil {
+		return
+	}
+	c.cacheMu.Lock()
+	c.nodeEtag, c.responseBodyHash = node.etag, node.bodyHash
+	c.cacheMu.Unlock()
 }
 
 func intervalToTime(i interface{}, fallback time.Duration) time.Duration {
@@ -294,16 +243,6 @@ func (t TlsSettings) EffectiveServerNames() []string {
 		return nil
 	}
 	return []string{t.ServerName}
-}
-
-func (t TlsSettings) EffectiveShortIds() []string {
-	if len(t.ShortIds) > 0 {
-		return t.ShortIds
-	}
-	if t.ShortId == "" {
-		return nil
-	}
-	return []string{t.ShortId}
 }
 
 func (t TlsSettings) PrimaryServerName() string {

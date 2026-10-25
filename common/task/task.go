@@ -25,18 +25,30 @@ type Task struct {
 	Timeout            time.Duration
 	Stop               chan struct{}
 	timeoutCount       atomic.Int32
+	lifetime           context.Context
+	cancel             context.CancelFunc
+	closed             bool
+	loopDone           chan struct{}
+	workerDone         chan struct{}
 }
 
 func (t *Task) Start(first bool) error {
 	t.Access.Lock()
+	if t.closed {
+		t.Access.Unlock()
+		return context.Canceled
+	}
 	if t.Running {
 		t.Access.Unlock()
 		return nil
 	}
 	t.Running = true
 	t.Stop = make(chan struct{})
+	t.loopDone = make(chan struct{})
+	stop, loopDone := t.Stop, t.loopDone
 	t.Access.Unlock()
 	go func() {
+		defer close(loopDone)
 		if first {
 			if err := t.ExecuteWithTimeout(); err != nil {
 				return
@@ -48,7 +60,7 @@ func (t *Task) Start(first bool) error {
 		for {
 			select {
 			case <-timer.C:
-			case <-t.Stop:
+			case <-stop:
 				return
 			}
 
@@ -90,17 +102,34 @@ func (t *Task) ExecuteWithTimeout() error {
 		}
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), t.currentTimeout())
+	t.Access.Lock()
+	if t.closed {
+		t.Access.Unlock()
+		t.ExecuteLock.Unlock()
+		return nil
+	}
+	if t.lifetime == nil {
+		t.lifetime, t.cancel = context.WithCancel(context.Background())
+	}
+	lifetime := t.lifetime
+	workerDone := make(chan struct{})
+	t.workerDone = workerDone
+	t.Access.Unlock()
+	ctx, cancel := context.WithTimeout(lifetime, t.currentTimeout())
 	defer cancel()
 	done := make(chan error, 1)
 
 	go func() {
+		defer close(workerDone)
 		defer t.ExecuteLock.Unlock()
 		done <- t.Execute(ctx)
 	}()
 
 	select {
 	case <-ctx.Done():
+		if lifetime.Err() != nil {
+			return nil
+		}
 		count := t.timeoutCount.Add(1)
 		if t.ReloadOnTimeout && t.ReloadCh != nil {
 			log.Errorf("Task %s execution timed out, reloading", t.Name)
@@ -134,7 +163,22 @@ func (t *Task) handleExitOnTimeout(count int32) {
 	}
 	log.Errorf("Task %s execution timed out %d consecutive time(s), exiting for systemd restart", t.Name, count)
 	go func() {
-		time.Sleep(200 * time.Millisecond)
+		t.Access.RLock()
+		lifetime := t.lifetime
+		closed := t.closed
+		t.Access.RUnlock()
+		if closed {
+			return
+		}
+		if lifetime != nil {
+			select {
+			case <-lifetime.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+		} else {
+			time.Sleep(200 * time.Millisecond)
+		}
 		os.Exit(1)
 	}()
 }
@@ -152,6 +196,10 @@ func (t *Task) currentTimeout() time.Duration {
 
 func (t *Task) safeStop() {
 	t.Access.Lock()
+	t.closed = true
+	if t.cancel != nil {
+		t.cancel()
+	}
 	if t.Running {
 		t.Running = false
 		close(t.Stop)
@@ -160,6 +208,31 @@ func (t *Task) safeStop() {
 }
 
 func (t *Task) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := t.CloseContext(ctx); err != nil {
+		log.WithError(err).Errorf("Task %s did not stop", t.Name)
+	}
+}
+
+// Cancel stops scheduling and cancels the current worker without waiting.
+func (t *Task) Cancel() { t.safeStop() }
+
+func (t *Task) CloseContext(ctx context.Context) error {
 	t.safeStop()
+	t.Access.RLock()
+	loopDone, workerDone := t.loopDone, t.workerDone
+	t.Access.RUnlock()
+	for _, done := range []chan struct{}{loopDone, workerDone} {
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	log.Warningf("Task %s stopped", t.Name)
+	return nil
 }
