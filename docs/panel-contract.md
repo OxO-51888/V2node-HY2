@@ -32,6 +32,22 @@ counters, statistics, and its per-node cursor in one database transaction.
 Replaying the last sequence with the same bytes does not charge twice. A changed
 payload or out-of-order sequence is rejected.
 
+A rejected traffic POST returns HTTP 409 with `error=traffic_sequence_conflict`,
+the rejected `request_sequence` and `request_digest`, and the panel's current
+`sequence`, `digest` and `next`. Contract headers and JSON content type are still
+required. Only an exact sequence collision with a different accepted digest proves
+that the immutable pending batch was not accepted at that sequence. The backend
+can durably rebase that batch to `next` without changing its rows, then retry once
+per reporting round. The recovered/live counter distinction must survive rebasing.
+If the cursor is further ahead, the response is malformed, or the rejected digest
+does not match the pending bytes, the backend retains the batch and reports the
+conflict instead of guessing whether to discard or charge it. Rebase persistence
+and acknowledgement failures follow the same durable replay rules as normal reports.
+
+Deploy the paired panel response before the backend recovery change. Legacy 409
+responses without proof never authorize rebasing. State and other node responses
+are private/no-store and vary by node identity; backend requests also bypass caches.
+
 The backend stores one cursor and at most one pending report per node under
 `StateDirectory` (default `/var/lib/v2node-hy2`). The service account needs write
 access. Preserve this directory during updates; do not share one node identity

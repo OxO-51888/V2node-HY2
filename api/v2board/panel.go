@@ -55,6 +55,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		SetAuthToken(c.Key).SetHeader("X-Node-ID", strconv.Itoa(c.NodeID)).
 		SetHeader("X-V2node-Contract", contractVersion).
 		SetHeader("Accept", "application/json").
+		SetHeader("Cache-Control", "no-cache, no-store").
 		SetHeader("User-Agent", "V2node-HY2/"+contractVersion).
 		SetRedirectPolicy(resty.NoRedirectPolicy()).SetRetryCount(0)
 	timeout := c.Timeout
@@ -88,7 +89,8 @@ func (c *Client) request(ctx context.Context, method, action, etag string, body 
 		return nil, "", false, fmt.Errorf("panel %s: missing response", action)
 	}
 	defer r.RawResponse.Body.Close()
-	if r.StatusCode() != 200 && r.StatusCode() != 304 {
+	conflict := r.StatusCode() == 409 && method == "POST" && action == "traffic"
+	if r.StatusCode() != 200 && r.StatusCode() != 304 && !conflict {
 		return nil, "", false, fmt.Errorf("panel %s: status %d", action, r.StatusCode())
 	}
 	if r.Header().Get("X-V2node-Contract") != contractVersion {
@@ -109,6 +111,9 @@ func (c *Client) request(ctx context.Context, method, action, etag string, body 
 	}
 	if len(data) > maxResponseBytes {
 		return nil, "", false, fmt.Errorf("panel %s: response too large", action)
+	}
+	if conflict {
+		return nil, "", false, decodeTrafficConflict(data)
 	}
 	return data, r.Header().Get("ETag"), false, nil
 }

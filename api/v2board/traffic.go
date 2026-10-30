@@ -194,6 +194,19 @@ func validateTrafficAck(ack *TrafficAck, sequence uint64, digest string) error {
 }
 
 func (c *Client) sendPending(ctx context.Context, commit func([]UserTraffic) error, revoke func([]int) error) error {
+	for attempt := 0; ; attempt++ {
+		err := c.sendPendingOnce(ctx, commit, revoke)
+		var conflict *trafficConflict
+		if attempt != 0 || !errors.As(err, &conflict) {
+			return err
+		}
+		if err := c.rebaseTrafficConflict(conflict); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) sendPendingOnce(ctx context.Context, commit func([]UserTraffic) error, revoke func([]int) error) error {
 	batch := c.outbox.Pending
 	if batch == nil {
 		return nil

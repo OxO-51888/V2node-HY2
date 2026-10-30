@@ -25,6 +25,16 @@ import (
 )
 
 func TestContractRuntimePHP(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		name := "normal"
+		if conflict {
+			name = "sequence-conflict"
+		}
+		t.Run(name, func(t *testing.T) { testContractRuntimePHP(t, conflict) })
+	}
+}
+
+func testContractRuntimePHP(t *testing.T, conflict bool) {
 	panelURL := os.Getenv("HY2_CONTRACT_URL")
 	if panelURL == "" {
 		t.Skip("isolated PHP/MySQL panel required")
@@ -97,6 +107,22 @@ func TestContractRuntimePHP(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	defer client.Close()
+	if conflict {
+		seed := []byte(`{"sequence":1,"rows":[{"uid":1,"u":7,"d":11}]}`)
+		req, _ := http.NewRequest("POST", panelURL+"/api/v2/server/hy2/traffic", bytes.NewReader(seed))
+		req.Header.Set("Authorization", "Bearer fixture-token")
+		req.Header.Set("X-Node-ID", "1")
+		req.Header.Set("X-V2node-Contract", "hy2-1")
+		req.Header.Set("Content-Type", "application/json")
+		seedResponse, err := httpClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedResponse.Body.Close()
+		if seedResponse.StatusCode != 200 {
+			t.Fatal("conflict seed", seedResponse.StatusCode)
+		}
+	}
 	origin, e := net.Listen("tcp4", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -148,7 +174,12 @@ func TestContractRuntimePHP(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if counters["upload"] != 32768 || counters["download"] != 32768 || counters["stats_upload"] != 32768 {
+	wantUpload, wantDownload := int64(32768), int64(32768)
+	if conflict {
+		wantUpload += 7
+		wantDownload += 11
+	}
+	if counters["upload"] != wantUpload || counters["download"] != wantDownload || counters["stats_upload"] != wantUpload {
 		t.Fatal("real accounting mismatch", counters)
 	}
 	denied := false
