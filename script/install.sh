@@ -478,60 +478,58 @@ EOF
         fi
 }
 
+stage_v2node_release() {
+    local dir="$1" version="$2" attempt expected actual member
+    local url="https://github.com/OxO-51888/V2node-HY2/releases/download/${version}/v2node-linux-${arch}.zip"
+    for attempt in 1 2 3; do
+        if curl -fLsS --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 300 "$url" -o "$dir/release.zip" &&
+           curl -fLsS --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 30 "${url}.sha256" -o "$dir/release.sha256"; then
+            read -r expected _ < "$dir/release.sha256"
+            actual=$(sha256sum "$dir/release.zip") || return 1
+            if [[ "$expected" =~ ^[[:xdigit:]]{64}$ && "${actual%% *}" == "${expected,,}" ]]; then
+                unzip -p "$dir/release.zip" v2node > "$dir/v2node" || return 1
+                chmod 755 "$dir/v2node" || return 1
+                timeout 15 "$dir/v2node" version >/dev/null 2>&1 || return 1
+                for member in geoip.dat geosite.dat; do
+                    unzip -p "$dir/release.zip" "$member" > "$dir/$member" || return 1
+                    [ -s "$dir/$member" ] || return 1
+                done
+                if unzip -Z1 "$dir/release.zip" | grep -Fxq config.json; then
+                    unzip -p "$dir/release.zip" config.json > "$dir/config.json" || return 1
+                    [ -s "$dir/config.json" ] || return 1
+                else
+                    printf '%s\n' '{"Log":{"Level":"warning"},"Nodes":[]}' > "$dir/config.json" || return 1
+                fi
+                return 0
+            fi
+        fi
+        echo "Release download/checksum failed; retry ${attempt}/3" >&2
+        sleep 2
+    done
+    return 1
+}
+
 install_v2node() {
-    local version_param="$1"
-    if [[ -e /usr/local/v2node/ ]]; then
-        rm -rf /usr/local/v2node/
+    local version_param="$1" stage member
+    last_version="${version_param:-latest}"
+    mkdir -p /usr/local/v2node /etc/v2node || return 1
+    stage=$(mktemp -d /usr/local/v2node/.install-XXXXXX) || return 1
+    trap "rm -rf -- $(printf '%q' "$stage")" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if ! stage_v2node_release "$stage" "$last_version"; then
+        rm -rf -- "$stage"
+        echo "Release unavailable. Existing backend was not removed or stopped." >&2
+        return 1
     fi
-
-    mkdir /usr/local/v2node/ -p
-    cd /usr/local/v2node/
-
-    if  [[ -z "$version_param" ]] ; then
-        if [[ "$arch" == "64" ]]; then
-            last_version="latest"
-            url="https://github.com/OxO-51888/V2node-HY2/releases/download/latest/v2node-linux-64.zip"
-            sha_url="${url}.sha256"
-            echo -e "${green}安装自用版：v2node official-hy2，开始下载...${plain}"
-            curl -fLs "$url" | pv -s 32M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-            if [[ $? -ne 0 ]]; then
-                echo -e "${red}?? v2node official-hy2 ??,??? GitHub Release ??${plain}"
-                exit 1
-            fi
-            if command -v sha256sum >/dev/null 2>&1; then
-                curl -fLs "$sha_url" -o /usr/local/v2node/v2node-linux.zip.sha256 >/dev/null 2>&1 && \
-                sed -i 's/  .*/  v2node-linux.zip/' /usr/local/v2node/v2node-linux.zip.sha256 && \
-                (cd /usr/local/v2node && sha256sum -c v2node-linux.zip.sha256 >/dev/null 2>&1) || {
-                    echo -e "${red}v2node official-hy2 校验失败${plain}"
-                    exit 1
-                }
-            fi
-        else
-            last_version="latest"
-            echo -e "${yellow}当前架构 ${arch} 暂无自用 official-hy2 包，回退安装官方版本：${last_version}${plain}"
-            url="https://github.com/OxO-51888/V2node-HY2/releases/download/${last_version}/v2node-linux-${arch}.zip"
-            curl -fLs "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-            if [[ $? -ne 0 ]]; then
-                echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
-                exit 1
-            fi
-        fi
-    else
-        last_version=$version_param
-        url="https://github.com/OxO-51888/V2node-HY2/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -fLs "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
-            exit 1
-        fi
-    fi
-
-    unzip v2node-linux.zip
-    rm v2node-linux.zip -f
-    chmod +x v2node
-    mkdir /etc/v2node/ -p
-    cp geoip.dat /etc/v2node/
-    cp geosite.dat /etc/v2node/
+    for member in geoip.dat geosite.dat; do
+        install -m 0644 "$stage/$member" "/etc/v2node/.${member}.new" &&
+            mv -f "/etc/v2node/.${member}.new" "/etc/v2node/$member" || { rm -rf -- "$stage"; return 1; }
+    done
+    mv -f "$stage/v2node" /usr/local/v2node/v2node || { rm -rf -- "$stage"; return 1; }
+    install -m 0600 "$stage/config.json" /usr/local/v2node/config.json || { rm -rf -- "$stage"; return 1; }
+    rm -rf -- "$stage"
+    cd /usr/local/v2node/ || return 1
     sync_v2node_masq_pages
     if [[ x"${release}" == x"alpine" ]]; then
         rm /etc/init.d/v2node -f
@@ -618,11 +616,17 @@ EOF
     fi
 
 
-    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/OxO-51888/V2node-HY2/main/script/v2node.sh
-    chmod +x /usr/bin/v2node
+    local manager_tmp
+    manager_tmp=$(mktemp /usr/bin/.v2node-XXXXXX) || return 1
+    if curl -fLsS --retry 3 --connect-timeout 15 --max-time 60 https://raw.githubusercontent.com/OxO-51888/V2node-HY2/main/script/v2node.sh -o "$manager_tmp" &&
+       [ -s "$manager_tmp" ] && bash -n "$manager_tmp"; then
+        chmod 755 "$manager_tmp" && mv -f "$manager_tmp" /usr/bin/v2node || return 1
+    else
+        rm -f "$manager_tmp"
+        echo "Manager download failed; backend installed, existing manager retained." >&2
+    fi
 
     cd $cur_dir
-    rm -f install.sh
     echo "------------------------------------------"
     echo -e "管理脚本使用方法: "
     echo "------------------------------------------"
