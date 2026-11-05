@@ -48,10 +48,13 @@ type TrafficAck struct {
 	Revoked  []int  `json:"revoked"`
 }
 type reportState struct {
-	Version  int           `json:"version"`
-	Next     uint64        `json:"next"`
-	Pending  *trafficBatch `json:"pending"`
-	Buffered []trafficRow  `json:"buffered,omitempty"`
+	Version    int                `json:"version"`
+	Next       uint64             `json:"next"`
+	Pending    *trafficBatch      `json:"pending"`
+	Buffered   []trafficRow       `json:"buffered,omitempty"`
+	Failures   int                `json:"failures,omitempty"`
+	Resolution *trafficResolution `json:"resolution,omitempty"`
+	Held       []trafficHold      `json:"held,omitempty"`
 }
 
 // One cursor and at most one pending batch per node: retries cannot grow a journal indefinitely.
@@ -91,7 +94,7 @@ func (c *Client) loadReportState(ctx context.Context) error {
 	if err == nil {
 		var state reportState
 		if json.Unmarshal(body, &state) != nil || state.Version != 1 || state.Next == 0 ||
-			len(state.Buffered) > 200000 || (state.Pending != nil && (state.Pending.Sequence != state.Next || len(state.Pending.Rows) > maxTrafficRows || len(state.Pending.Rows) == 0)) {
+			len(state.Buffered) > 200000 || !validTrafficIsolation(&state) || (state.Pending != nil && (state.Pending.Sequence != state.Next || len(state.Pending.Rows) > maxTrafficRows || len(state.Pending.Rows) == 0)) {
 			return fmt.Errorf("invalid traffic outbox; refusing to discard unconfirmed traffic")
 		}
 		c.outbox = &state
@@ -131,7 +134,17 @@ func (c *Client) saveReportState(state *reportState) error {
 		return err
 	}
 	if len(body) > 16<<20 {
-		return fmt.Errorf("traffic state exceeds durable size bound")
+		// Audit retention must not block real accounting near the outbox limit.
+		if len(state.Held) > 0 {
+			state.Held = nil
+			body, err = json.Marshal(state)
+			if err != nil {
+				return err
+			}
+		}
+		if len(body) > 16<<20 {
+			return fmt.Errorf("traffic state exceeds durable size bound")
+		}
 	}
 	f, err := os.CreateTemp(filepath.Dir(c.outboxPath), ".traffic-*")
 	if err != nil {
@@ -194,10 +207,32 @@ func validateTrafficAck(ack *TrafficAck, sequence uint64, digest string) error {
 }
 
 func (c *Client) sendPending(ctx context.Context, commit func([]UserTraffic) error, revoke func([]int) error) error {
+	if c.outbox.Resolution != nil {
+		return c.finishTrafficIsolation(ctx, commit, revoke)
+	}
 	for attempt := 0; ; attempt++ {
 		err := c.sendPendingOnce(ctx, commit, revoke)
+		var uncertain *unconfirmedTraffic
+		if !errors.As(err, &uncertain) {
+			return err
+		}
+		next := *c.outbox
+		next.Failures = min(next.Failures+1, 3)
+		if saveErr := c.saveReportState(&next); saveErr != nil {
+			return saveErr
+		}
 		var conflict *trafficConflict
-		if attempt != 0 || !errors.As(err, &conflict) {
+		if errors.As(err, &conflict) && canIsolateTraffic(conflict, c.outbox.Pending) {
+			return c.isolateTraffic(ctx, conflict.Next, commit, revoke)
+		}
+		if c.outbox.Failures >= 3 {
+			cursor, cursorErr := c.readTrafficCursor(ctx)
+			if cursorErr != nil {
+				return fmt.Errorf("traffic unresolved; cannot confirm current panel cursor: %w", cursorErr)
+			}
+			return c.isolateTraffic(ctx, cursor, commit, revoke)
+		}
+		if attempt != 0 || conflict == nil {
 			return err
 		}
 		if err := c.rebaseTrafficConflict(conflict); err != nil {
@@ -218,14 +253,14 @@ func (c *Client) sendPendingOnce(ctx context.Context, commit func([]UserTraffic)
 	digest := fmt.Sprintf("%x", sha256.Sum256(body))
 	response, _, _, err := c.request(ctx, "POST", "traffic", "", body)
 	if err != nil {
-		return err
+		return &unconfirmedTraffic{err}
 	}
 	var ack TrafficAck
 	if err = json.Unmarshal(response, &ack); err != nil {
-		return fmt.Errorf("decode traffic acknowledgement: %w", err)
+		return &unconfirmedTraffic{fmt.Errorf("decode traffic acknowledgement: %w", err)}
 	}
 	if err = validateTrafficAck(&ack, batch.Sequence, digest); err != nil {
-		return err
+		return &unconfirmedTraffic{err}
 	}
 	if !c.committed && !c.recovered {
 		rows := make([]UserTraffic, 0, len(batch.Rows))
@@ -244,7 +279,7 @@ func (c *Client) sendPendingOnce(ctx context.Context, commit func([]UserTraffic)
 	if len(batch.Rows) > 0 {
 		c.lastTrafficUID = batch.Rows[len(batch.Rows)-1].UID
 	}
-	next := &reportState{Version: 1, Next: batch.Sequence + 1, Buffered: c.outbox.Buffered}
+	next := &reportState{Version: 1, Next: batch.Sequence + 1, Buffered: c.outbox.Buffered, Held: trimTrafficHolds(c.outbox.Held, time.Now().Unix())}
 	if next.Next == 0 {
 		return fmt.Errorf("report sequence overflow")
 	}
@@ -302,7 +337,7 @@ func (c *Client) FlushTrafficLimit(ctx context.Context, capture func() ([]UserTr
 		if err != nil {
 			return err
 		}
-		next := &reportState{Version: 1, Next: c.outbox.Next, Pending: &trafficBatch{Sequence: c.outbox.Next, Rows: selected}, Buffered: rest}
+		next := &reportState{Version: 1, Next: c.outbox.Next, Pending: &trafficBatch{Sequence: c.outbox.Next, Rows: selected}, Buffered: rest, Held: c.outbox.Held}
 		// Buffered bytes came from an earlier, quiesced runtime, not current counters.
 		c.recovered = true
 		if err := c.saveReportState(next); err != nil {
@@ -338,7 +373,7 @@ func (c *Client) FlushTrafficLimit(ctx context.Context, capture func() ([]UserTr
 			return err
 		}
 		batch := &trafficBatch{Sequence: c.outbox.Next, Rows: selected}
-		next := &reportState{Version: 1, Next: c.outbox.Next, Pending: batch}
+		next := &reportState{Version: 1, Next: c.outbox.Next, Pending: batch, Held: c.outbox.Held}
 		if err = c.saveReportState(next); err != nil {
 			return err
 		}
@@ -428,7 +463,9 @@ func (c *Client) PersistTraffic(ctx context.Context, capture func() ([]UserTraff
 	if len(buffer) > 200000 {
 		return fmt.Errorf("final accounting exceeds bounded outbox")
 	}
-	if err := c.saveReportState(&reportState{Version: 1, Next: c.outbox.Next, Pending: c.outbox.Pending, Buffered: buffer}); err != nil {
+	next := *c.outbox
+	next.Buffered = buffer
+	if err := c.saveReportState(&next); err != nil {
 		return err
 	}
 	c.drainSaved = true

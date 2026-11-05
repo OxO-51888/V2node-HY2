@@ -57,6 +57,7 @@ func (c *Client) rebaseTrafficConflict(conflict *trafficConflict) error {
 	// Persist the new identity before retrying. Do not alter counters, rows,
 	// buffered shutdown traffic, or the recovered/current-runtime distinction.
 	next := &reportState{Version: 1, Next: conflict.Next,
-		Pending: &trafficBatch{Sequence: conflict.Next, Rows: batch.Rows}, Buffered: c.outbox.Buffered}
+		Pending: &trafficBatch{Sequence: conflict.Next, Rows: batch.Rows}, Buffered: c.outbox.Buffered,
+		Failures: c.outbox.Failures, Held: c.outbox.Held}
 	return c.saveReportState(next)
 }

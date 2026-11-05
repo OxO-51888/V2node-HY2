@@ -14,6 +14,14 @@ import (
 )
 
 func TestHY2PHPConflictInteroperability(t *testing.T) {
+	testHY2PHPConflictInteroperability(t, false)
+}
+
+func TestHY2PHPIsolationInteroperability(t *testing.T) {
+	testHY2PHPConflictInteroperability(t, true)
+}
+
+func testHY2PHPConflictInteroperability(t *testing.T, isolation bool) {
 	origin := os.Getenv("HY2_CONTRACT_URL")
 	if origin == "" {
 		t.Skip("isolated PHP/MySQL panel required")
@@ -50,6 +58,16 @@ func TestHY2PHPConflictInteroperability(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatal("seed report", res.StatusCode)
 	}
+	if isolation {
+		old = []byte(`{"sequence":2,"rows":[{"uid":1,"u":7,"d":11}]}`)
+		if _, _, _, err = c.request(context.Background(), "POST", "traffic", "", old); err != nil {
+			t.Fatal(err)
+		}
+		if err = c.saveReportState(&reportState{Version: 1, Next: 1, Pending: &trafficBatch{Sequence: 1, Rows: []trafficRow{{UID: 1, Upload: 50}}}}); err != nil {
+			t.Fatal(err)
+		}
+		c.recovered = true
+	}
 	u, d, commits := int64(400), int64(600), 0
 	var revoked []int
 	err = c.FlushTraffic(context.Background(), func() ([]UserTraffic, error) {
@@ -61,7 +79,11 @@ func TestHY2PHPConflictInteroperability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u+d != 0 || commits != 1 || len(revoked) != 1 || revoked[0] != 1 || c.outbox.Next != 3 {
+	wantNext := uint64(3)
+	if isolation {
+		wantNext = 4
+	}
+	if u+d != 0 || commits != 1 || len(revoked) != 1 || revoked[0] != 1 || c.outbox.Next != wantNext {
 		t.Fatal("recovery/limit failure", u, d, commits, revoked, c.outbox)
 	}
 	res, err = client.Get(origin + "/__fixture/counters")
@@ -73,7 +95,15 @@ func TestHY2PHPConflictInteroperability(t *testing.T) {
 	if err = json.UnmarshalRead(res.Body, &counters); err != nil {
 		t.Fatal(err)
 	}
-	if counters["upload"] != 407 || counters["download"] != 611 || counters["stats_upload"] != 407 || counters["sequence"] != 2 {
+	wantUpload, wantDownload := int64(407), int64(611)
+	if isolation {
+		wantUpload += 7
+		wantDownload += 11
+		if len(c.outbox.Held) != 1 {
+			t.Fatal("no audit record")
+		}
+	}
+	if counters["upload"] != wantUpload || counters["download"] != wantDownload || counters["stats_upload"] != wantUpload || counters["sequence"] != int64(wantNext)-1 {
 		t.Fatal("double or missing billing", counters)
 	}
 	t.Log("real PHP/MySQL 409 -> durable rebase -> exact billing -> quota revocation passed")

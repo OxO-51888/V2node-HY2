@@ -39,10 +39,22 @@ required. Only an exact sequence collision with a different accepted digest prov
 that the immutable pending batch was not accepted at that sequence. The backend
 can durably rebase that batch to `next` without changing its rows, then retry once
 per reporting round. The recovered/live counter distinction must survive rebasing.
-If the cursor is further ahead, the response is malformed, or the rejected digest
-does not match the pending bytes, the backend retains the batch and reports the
-conflict instead of guessing whether to discard or charge it. Rebase persistence
-and acknowledgement failures follow the same durable replay rules as normal reports.
+If a verified cursor is further ahead, historical acceptance cannot be proved.
+The backend durably isolates that batch without resubmitting its bytes, then
+continues subsequent traffic at the confirmed cursor. Other unconfirmed responses
+are retried up to three times; isolation then requires a fresh, authenticated
+`state` response containing consistent `sequence`, `digest`, and `next` fields.
+Unavailable or malformed cursor responses do not authorize guessing a sequence.
+This policy intentionally favors possible undercounting over duplicate charges
+or an indefinitely blocked historical batch. It does not repair a panel outage.
+
+A durable resolution marker precedes RAM-counter consumption. A restart never
+resubmits a marked batch or subtracts its bytes from the new runtime. Before
+finishing isolation the backend refreshes user eligibility and revokes affected
+exhausted/removed users; eligibility failures retain the marker for retry.
+Isolated batches are audit-only, never automatically rebilled. The outbox keeps
+at most 16 such batches, expires them after seven days on subsequent progress,
+and can omit them to stay within its size bound. No growing sidecar journal is used.
 
 Deploy the paired panel response before the backend recovery change. Legacy 409
 responses without proof never authorize rebasing. State and other node responses
@@ -53,7 +65,7 @@ The backend stores one cursor and at most one pending report per node under
 access. Preserve this directory during updates; do not share one node identity
 between multiple backend processes. A pending report is written and synchronized
 before sending. Acknowledgement loss retries the exact report. Only a verified
-acknowledgement permits in-memory counters to be committed. Corrupt state fails
+acknowledgement or durable isolation decision permits in-memory counters to be committed. Corrupt state fails
 closed rather than silently discarding unconfirmed usage.
 
 Revocation stops authorization immediately but retains the user's tail counters

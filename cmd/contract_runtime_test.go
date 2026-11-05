@@ -43,6 +43,14 @@ func TestContractRuntimeChild(t *testing.T) {
 // Runs the real command, six controllers, QUIC listeners and echo traffic.
 // Every endpoint and database fixture is private to this test.
 func TestContractRuntimeProcess(t *testing.T) {
+	testContractRuntimeProcess(t, false)
+}
+
+func TestContractRuntimeIsolation(t *testing.T) {
+	testContractRuntimeProcess(t, true)
+}
+
+func testContractRuntimeProcess(t *testing.T, isolation bool) {
 	dir := t.TempDir()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{"fixture.invalid"}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
@@ -92,8 +100,9 @@ func TestContractRuntimeProcess(t *testing.T) {
 		case "state":
 			billingMu.Lock()
 			next := sequences[id] + 1
+			sequence, digest := sequences[id], digests[id]
 			billingMu.Unlock()
-			json.NewEncoder(w).Encode(map[string]any{"next": next})
+			json.NewEncoder(w).Encode(map[string]any{"sequence": sequence, "digest": digest, "next": next})
 		case "alive":
 			if r.Method == "POST" {
 				heartbeats.Add(1)
@@ -132,8 +141,10 @@ func TestContractRuntimeProcess(t *testing.T) {
 				sequences[id] = b.Sequence
 				digests[id] = digest
 			} else if b.Sequence != sequences[id] || digests[id] != digest {
+				sequence, previous := sequences[id], digests[id]
 				billingMu.Unlock()
-				http.Error(w, "sequence", 409)
+				w.WriteHeader(409)
+				json.NewEncoder(w).Encode(map[string]any{"error": "traffic_sequence_conflict", "sequence": sequence, "next": sequence + 1, "digest": previous, "request_sequence": b.Sequence, "request_digest": digest})
 				return
 			}
 			billingMu.Unlock()
@@ -168,6 +179,20 @@ func TestContractRuntimeProcess(t *testing.T) {
 	cfg, _ := json.Marshal(map[string]any{"Log": map[string]any{"Level": "info"}, "Nodes": nodes})
 	cfgPath := filepath.Join(dir, "config.json")
 	os.WriteFile(cfgPath, cfg, 0600)
+	if isolation {
+		os.MkdirAll(filepath.Join(dir, "state"), 0700)
+		billingMu.Lock()
+		for id := 1; id <= 6; id++ {
+			sequences[id] = 2
+			digests[id] = strings.Repeat("a", 64)
+			identity := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", api.URL, id)))
+			state := fmt.Sprintf(`{"version":1,"next":1,"pending":{"sequence":1,"rows":[{"uid":%d,"u":7,"d":11}]}}`, id)
+			if err := os.WriteFile(filepath.Join(dir, "state", fmt.Sprintf("%x.json", identity[:16])), []byte(state), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		billingMu.Unlock()
+	}
 	var child *exec.Cmd
 	var done chan error
 	start := func() {
@@ -256,6 +281,21 @@ func TestContractRuntimeProcess(t *testing.T) {
 		if e := echo(clients[i]); e != nil {
 			t.Fatal(e)
 		}
+	}
+	if isolation {
+		files, _ := filepath.Glob(filepath.Join(dir, "state", "*.json"))
+		if len(files) != 6 {
+			t.Fatal("missing recovered controllers")
+		}
+		for _, file := range files {
+			body, _ := os.ReadFile(file)
+			var state struct{ Held []any }
+			json.Unmarshal(body, &state)
+			if len(state.Held) != 1 {
+				t.Fatal("ambiguous batch not isolated", file)
+			}
+		}
+		t.Log("all six real controllers started past historical cursor conflict; QUIC forwarding works")
 	}
 	slow.Store(true)
 	before := heartbeats.Load()

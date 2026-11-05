@@ -30,6 +30,10 @@ func (c *Client) GetUsers(ctx context.Context) (*UserSnapshot, error) {
 	c.cacheMu.Lock()
 	etag := c.userEtag
 	c.cacheMu.Unlock()
+	return c.getUsers(ctx, etag)
+}
+
+func (c *Client) getUsers(ctx context.Context, etag string) (*UserSnapshot, error) {
 	body, next, unchanged, err := c.request(ctx, "GET", "users", etag, nil)
 	if err != nil || unchanged {
 		return nil, err
