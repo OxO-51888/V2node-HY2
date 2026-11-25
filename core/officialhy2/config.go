@@ -77,6 +77,10 @@ func (n *Node) buildConfig(info *panel.NodeInfo) (*server.Config, error) {
 		return nil, err
 	}
 	quicConfig := n.getQUICConfig()
+	bandwidth, err := n.getBandwidthConfig(info)
+	if err != nil {
+		return nil, err
+	}
 	outbound, err := n.getOutboundConfig()
 	if err != nil {
 		return nil, err
@@ -95,7 +99,7 @@ func (n *Node) buildConfig(info *panel.NodeInfo) (*server.Config, error) {
 		CongestionConfig: server.CongestionConfig{
 			Type: "bbr",
 		},
-		BandwidthConfig:       *n.getBandwidthConfig(info),
+		BandwidthConfig:       *bandwidth,
 		IgnoreClientBandwidth: info.Common.Ignore_Client_Bandwidth,
 		DisableUDP:            false,
 		UDPIdleTimeout:        defaultUDPIdleTimeout,
@@ -256,10 +260,19 @@ func (n *Node) getConn(info *panel.NodeInfo) (net.PacketConn, error) {
 	}
 }
 
-func (n *Node) getBandwidthConfig(info *panel.NodeInfo) *server.BandwidthConfig {
-	bandwidth := &server.BandwidthConfig{ForceServerBandwidth: true}
+func (n *Node) getBandwidthConfig(info *panel.NodeInfo) (*server.BandwidthConfig, error) {
+	const key = "V2NODE_FORCE_SERVER_BANDWIDTH"
+	var force bool
+	if raw, ok := os.LookupEnv(key); ok {
+		v, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("%s must be a boolean: %w", key, err)
+		}
+		force = v
+	}
+	bandwidth := &server.BandwidthConfig{ForceServerBandwidth: force}
 	if info.Common == nil {
-		return bandwidth
+		return bandwidth, nil
 	}
 	if info.Common.UpMbps != 0 {
 		bandwidth.MaxTx = uint64(info.Common.UpMbps * megabyteSize / 8)
@@ -267,7 +280,7 @@ func (n *Node) getBandwidthConfig(info *panel.NodeInfo) *server.BandwidthConfig 
 	if info.Common.DownMbps != 0 {
 		bandwidth.MaxRx = uint64(info.Common.DownMbps * megabyteSize / 8)
 	}
-	return bandwidth
+	return bandwidth, nil
 }
 
 func (n *Node) getOutboundConfig() (server.Outbound, error) {

@@ -11,6 +11,15 @@ It does not fall back to UniProxy or the generic V2 server API. Upgrade the pane
 and backend as one coordinated release; do not install this candidate against an
 unmodified panel. See [the API contract](docs/panel-contract.md).
 
+## Server Bandwidth Policy
+
+`V2NODE_FORCE_SERVER_BANDWIDTH` controls the HY2 server bandwidth policy for
+all listeners in one process. Unset or `false` uses normal HY2 negotiation
+with the client's bandwidth settings. Set `true` to force the server policy.
+Neither setting changes panel rates, user quotas, or blocking rules. Set the
+environment variable on the service and restart it to apply the change. Remove
+the override and restart to restore the default.
+
 ## UDP Receive Buffer
 
 Each HY2 listener requests a 32 MiB socket receive buffer before QUIC starts.

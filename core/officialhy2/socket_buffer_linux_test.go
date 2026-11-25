@@ -75,8 +75,9 @@ func TestUDPReceiveBufferHY2Runtime(t *testing.T) {
 			_, _ = udpOrigin.WriteToUDP(buf[:n], addr)
 		}
 	}()
-	for _, site := range []string{"gm", "nnm", "ovo", "yiyuan", "clash", "pianyi"} {
+	for i, site := range []string{"gm", "nnm", "ovo", "yiyuan", "clash", "pianyi"} {
 		t.Run(site, func(t *testing.T) {
+			force := i%2 == 0
 			n := &Node{}
 			conn, err := n.getConn(&panel.NodeInfo{Common: &panel.CommonNode{ListenIP: "127.0.0.1"}})
 			if err != nil {
@@ -87,11 +88,23 @@ func TestUDPReceiveBufferHY2Runtime(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			var bw *server.BandwidthConfig
+			if !t.Run("policy", func(t *testing.T) {
+				t.Setenv("V2NODE_FORCE_SERVER_BANDWIDTH", fmt.Sprint(force))
+				var err error
+				bw, err = n.getBandwidthConfig(&panel.NodeInfo{Common: &panel.CommonNode{UpMbps: 8000, DownMbps: 8000}})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}) {
+				t.FailNow()
+			}
 			srv, err := server.NewServer(&server.Config{
 				Conn: conn, TLSConfig: server.TLSConfig{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: private}}},
-				Authenticator:   &Authenticator{users: map[string]int{"test-user": 1}},
-				QUICConfig:      *n.getQUICConfig(),
-				BandwidthConfig: *n.getBandwidthConfig(&panel.NodeInfo{Common: &panel.CommonNode{UpMbps: 8000, DownMbps: 8000}}),
+				Authenticator:         &Authenticator{users: map[string]int{"test-user": 1}},
+				QUICConfig:            *n.getQUICConfig(),
+				BandwidthConfig:       *bw,
+				IgnoreClientBandwidth: true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -102,14 +115,19 @@ func TestUDPReceiveBufferHY2Runtime(t *testing.T) {
 				for i := 0; i < 8; i++ {
 					t.Run(fmt.Sprint(i), func(t *testing.T) {
 						t.Parallel()
-						c, _, err := hyclient.NewClient(&hyclient.Config{
+						const clientTx = 50 * megabyteSize / 8
+						c, hs, err := hyclient.NewClient(&hyclient.Config{
 							ServerAddr: conn.LocalAddr(), Auth: "test-user",
-							TLSConfig: hyclient.TLSConfig{InsecureSkipVerify: true},
+							BandwidthConfig: hyclient.BandwidthConfig{MaxTx: clientTx},
+							TLSConfig:       hyclient.TLSConfig{InsecureSkipVerify: true},
 						})
 						if err != nil {
 							t.Fatal(err)
 						}
 						defer c.Close()
+						if (force && hs.Tx != clientTx) || (!force && hs.Tx != 0) {
+							t.Fatalf("negotiated Tx = %d, force = %t", hs.Tx, force)
+						}
 						stream, err := c.TCP(strings.TrimPrefix(origin.URL, "http://"))
 						if err != nil {
 							t.Fatal(err)

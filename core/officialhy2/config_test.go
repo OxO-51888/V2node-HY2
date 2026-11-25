@@ -2,6 +2,7 @@ package officialhy2
 
 import (
 	"net"
+	"os"
 	"strings"
 	"testing"
 
@@ -94,22 +95,31 @@ func TestQUICConfigUsesOfficialDefaults(t *testing.T) {
 	}
 }
 
-func TestBandwidthConfigForcesServerBandwidth(t *testing.T) {
-	n := &Node{}
-	cfg := n.getBandwidthConfig(&panel.NodeInfo{
-		Common: &panel.CommonNode{
-			UpMbps:   500,
-			DownMbps: 500,
-		},
-	})
-	if !cfg.ForceServerBandwidth {
-		t.Fatal("force server bandwidth is disabled")
-	}
-	if cfg.MaxTx != 500*megabyteSize/8 {
-		t.Fatalf("max tx = %d, want %d", cfg.MaxTx, 500*megabyteSize/8)
-	}
-	if cfg.MaxRx != 500*megabyteSize/8 {
-		t.Fatalf("max rx = %d, want %d", cfg.MaxRx, 500*megabyteSize/8)
+func TestForceServerBandwidthSwitch(t *testing.T) {
+	const key = "V2NODE_FORCE_SERVER_BANDWIDTH"
+	for _, tc := range []struct {
+		value string
+		want  bool
+		bad   bool
+	}{{"unset", false, false}, {"true", true, false}, {"false", false, false}, {"oops", false, true}, {"", false, true}} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv(key, tc.value)
+			if tc.value == "unset" {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := (&Node{}).getBandwidthConfig(&panel.NodeInfo{Common: &panel.CommonNode{UpMbps: 500, DownMbps: 8000}})
+			if tc.bad {
+				if err == nil || !strings.Contains(err.Error(), key) {
+					t.Fatalf("expected error naming the switch, got %v", err)
+				}
+				return
+			}
+			if err != nil || cfg.ForceServerBandwidth != tc.want || cfg.MaxTx != 500*megabyteSize/8 || cfg.MaxRx != 8000*megabyteSize/8 {
+				t.Fatalf("bandwidth config = %+v, err = %v", cfg, err)
+			}
+		})
 	}
 }
 
