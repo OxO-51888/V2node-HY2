@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -156,12 +157,12 @@ func (s *serverImpl) handleClient(conn *quic.Conn) {
 	}
 	err := h3s.ServeQUICConn(conn)
 	// If the client is authenticated, we need to log the disconnect event
-	if handler.authenticated {
+	if id := handler.authID.Load(); id != nil {
 		if tl := s.config.TrafficLogger; tl != nil {
-			tl.LogOnlineState(handler.authID, false)
+			tl.LogOnlineState(*id, false)
 		}
 		if el := s.config.EventLogger; el != nil {
-			el.Disconnect(conn.RemoteAddr(), handler.authID, err)
+			el.Disconnect(conn.RemoteAddr(), *id, err)
 		}
 	}
 	_ = conn.CloseWithError(closeErrCodeOK, "")
@@ -171,10 +172,9 @@ type h3sHandler struct {
 	config *Config
 	conn   *quic.Conn
 
-	authenticated bool
-	authMutex     sync.Mutex
-	authID        string
-	connID        uint32 // a random id for dump streams
+	authMutex sync.Mutex
+	authID    atomic.Pointer[string]
+	connID    uint32 // a random id for dump streams
 
 	udpSM *udpSessionManager // Only set after authentication
 }
@@ -191,7 +191,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
 		h.authMutex.Lock()
 		defer h.authMutex.Unlock()
-		if h.authenticated {
+		if h.authID.Load() != nil {
 			// Already authenticated
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !h.config.DisableUDP,
@@ -205,9 +205,6 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		actualTx := selectServerTxForCongestion(authReq.Rx, h.config.BandwidthConfig)
 		ok, id := h.config.Authenticator.Authenticate(h.conn.RemoteAddr(), authReq.Auth, actualTx)
 		if ok {
-			// Set authenticated flag
-			h.authenticated = true
-			h.authID = id
 			if shouldUseBrutal(h.config.IgnoreClientBandwidth, actualTx, h.config.BandwidthConfig) {
 				congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
 			} else {
@@ -215,6 +212,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
 				actualTx = 0
 			}
+			h.authID.Store(&id)
 			// Auth OK, send response
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !h.config.DisableUDP,
@@ -254,7 +252,8 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if err != nil || !h.authenticated {
+	id := h.authID.Load()
+	if err != nil || id == nil {
 		return false, nil
 	}
 
@@ -267,20 +266,20 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 		}
 		// Wraps the stream with QStream, which handles Close() properly
 		qStream := &utils.QStream{Stream: stream}
-		go h.handleTCPRequest(qStream)
+		go h.handleTCPRequest(qStream, *id)
 		return true, nil
 	default:
 		return false, nil
 	}
 }
 
-func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
+func (h *h3sHandler) handleTCPRequest(stream *utils.QStream, authID string) {
 	trafficLogger := h.config.TrafficLogger
 	trackStats := shouldTrackStreamStats(trafficLogger)
 	var streamStats *StreamStats
 	if trackStats {
 		streamStats = &StreamStats{
-			AuthID:      h.authID,
+			AuthID:      authID,
 			ConnID:      h.connID,
 			InitialTime: time.Now(),
 		}
@@ -329,7 +328,7 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	}
 	// Log the event
 	if h.config.EventLogger != nil {
-		h.config.EventLogger.TCPRequest(h.conn.RemoteAddr(), h.authID, reqAddr)
+		h.config.EventLogger.TCPRequest(h.conn.RemoteAddr(), authID, reqAddr)
 	}
 	// Dial target
 	if streamStats != nil {
@@ -343,7 +342,7 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		_ = stream.Close()
 		// Log the error
 		if h.config.EventLogger != nil {
-			h.config.EventLogger.TCPError(h.conn.RemoteAddr(), h.authID, reqAddr, err)
+			h.config.EventLogger.TCPError(h.conn.RemoteAddr(), authID, reqAddr, err)
 		}
 		return
 	}
@@ -362,13 +361,13 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	}
 	// Start proxying
 	if trafficLogger != nil {
-		err = copyTwoWayEx(h.authID, stream, tConn, trafficLogger, streamStats)
+		err = copyTwoWayEx(authID, stream, tConn, trafficLogger, streamStats)
 	} else {
 		// Use the fast path if no traffic logger is set
 		err = copyTwoWay(stream, tConn)
 	}
 	if h.config.EventLogger != nil {
-		h.config.EventLogger.TCPError(h.conn.RemoteAddr(), h.authID, reqAddr, err)
+		h.config.EventLogger.TCPError(h.conn.RemoteAddr(), authID, reqAddr, err)
 	}
 	// Cleanup
 	_ = tConn.Close()

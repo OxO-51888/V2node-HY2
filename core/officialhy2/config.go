@@ -2,6 +2,7 @@ package officialhy2
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/outbounds"
+	log "github.com/sirupsen/logrus"
 	"go.uber.org/zap"
 )
 
@@ -38,13 +40,14 @@ type certificateCache struct {
 	keyFile       string
 	checkInterval time.Duration
 
-	mu          sync.RWMutex
-	cert        tls.Certificate
-	certModTime time.Time
-	keyModTime  time.Time
-	certSize    int64
-	keySize     int64
-	lastCheck   time.Time
+	mu              sync.RWMutex
+	cert            tls.Certificate
+	certInfo        os.FileInfo
+	keyInfo         os.FileInfo
+	lastCheck       time.Time
+	lastReloadWarn  time.Time
+	lastExpiryWarn  time.Time
+	expiryWarnedFor time.Time
 }
 
 type masqHandlerLogWrapper struct {
@@ -115,7 +118,6 @@ func (n *Node) getTLSConfig(info *panel.NodeInfo) (*server.TLSConfig, error) {
 			return nil, err
 		}
 		return &server.TLSConfig{
-			Certificates:   []tls.Certificate{certCache.current()},
 			GetCertificate: certCache.GetCertificate,
 		}, nil
 	}
@@ -130,13 +132,16 @@ func newCertificateCache(certFile, keyFile string, checkInterval time.Duration) 
 	if err := cache.reloadLocked(); err != nil {
 		return nil, err
 	}
+	cache.checkExpiryLocked(time.Now())
 	return cache, nil
 }
 
-func (c *certificateCache) current() tls.Certificate {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.cert
+func (c *certificateCache) checkExpiryLocked(now time.Time) {
+	exp := c.cert.Leaf.NotAfter
+	if exp.Sub(now) <= 14*24*time.Hour && (exp != c.expiryWarnedFor || now.Sub(c.lastExpiryWarn) >= 24*time.Hour) {
+		c.lastExpiryWarn, c.expiryWarnedFor = now, exp
+		log.WithFields(log.Fields{"cert_file": c.certFile, "not_after": exp.UTC()}).Warn("Serving TLS certificate near or past expiry")
+	}
 }
 
 func (c *certificateCache) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -152,15 +157,19 @@ func (c *certificateCache) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificat
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if now.Sub(c.lastCheck) >= c.checkInterval {
-		if changed, err := c.changedLocked(); err != nil {
-			c.lastCheck = now
-		} else if changed {
-			if err := c.reloadLocked(); err != nil {
-				c.lastCheck = now
-			}
-		} else {
-			c.lastCheck = now
+		changed, err := c.changedLocked()
+		if err == nil && changed {
+			err = c.reloadLocked()
 		}
+		if err != nil && (c.lastReloadWarn.IsZero() || now.Sub(c.lastReloadWarn) >= 10*time.Minute) {
+			log.WithFields(log.Fields{"cert_file": c.certFile, "not_after": c.cert.Leaf.NotAfter.UTC()}).WithError(err).Warn("TLS certificate refresh failed; retaining serving certificate")
+			c.lastReloadWarn = now
+		} else if err == nil && !c.lastReloadWarn.IsZero() {
+			log.WithField("cert_file", c.certFile).Info("TLS certificate refresh healthy")
+			c.lastReloadWarn = time.Time{}
+		}
+		c.checkExpiryLocked(now)
+		c.lastCheck = now
 	}
 	cert := c.cert
 	return &cert, nil
@@ -175,17 +184,14 @@ func (c *certificateCache) changedLocked() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !certStat.ModTime().Equal(c.certModTime) ||
-		!keyStat.ModTime().Equal(c.keyModTime) ||
-		certStat.Size() != c.certSize ||
-		keyStat.Size() != c.keySize, nil
+	return !sameCertFile(certStat, c.certInfo) || !sameCertFile(keyStat, c.keyInfo), nil
+}
+
+func sameCertFile(a, b os.FileInfo) bool {
+	return b != nil && os.SameFile(a, b) && a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size()
 }
 
 func (c *certificateCache) reloadLocked() error {
-	cert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
-	if err != nil {
-		return err
-	}
 	certStat, err := os.Stat(c.certFile)
 	if err != nil {
 		return err
@@ -194,11 +200,34 @@ func (c *certificateCache) reloadLocked() error {
 	if err != nil {
 		return err
 	}
+	cert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
+	if err != nil {
+		return err
+	}
+	if cert.Leaf == nil {
+		cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return err
+		}
+	}
+	// Parse success only proves that the key matches, not that the replacement
+	// is usable now. Keep the current certificate until the whole supplied
+	// chain is within its validity period.
+	now := time.Now()
+	for i, der := range cert.Certificate {
+		part := cert.Leaf
+		if i > 0 {
+			part, err = x509.ParseCertificate(der)
+			if err != nil {
+				return fmt.Errorf("parse certificate chain entry %d: %w", i, err)
+			}
+		}
+		if now.Before(part.NotBefore) || !now.Before(part.NotAfter) {
+			return fmt.Errorf("certificate chain entry %d is not currently valid (not_before=%s not_after=%s)", i, part.NotBefore.UTC().Format(time.RFC3339), part.NotAfter.UTC().Format(time.RFC3339))
+		}
+	}
 	c.cert = cert
-	c.certModTime = certStat.ModTime()
-	c.keyModTime = keyStat.ModTime()
-	c.certSize = certStat.Size()
-	c.keySize = keyStat.Size()
+	c.certInfo, c.keyInfo = certStat, keyStat
 	c.lastCheck = time.Now()
 	return nil
 }

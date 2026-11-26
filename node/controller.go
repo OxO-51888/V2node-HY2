@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ type Controller struct {
 	closed                  bool
 	infoAccess              sync.RWMutex
 	lastReloadAt            time.Time
+	awaitingAdmission       bool
 }
 
 // NewController return a Node controller with default parameters.
@@ -54,27 +56,20 @@ func (c *Controller) Start(x *core.V2Core) (err error) {
 	return c.StartContext(context.Background(), x)
 }
 
+// The onboarding check reads these sparse lifecycle events from this systemd
+// invocation only. Readiness must not depend on the configured log level.
+func (c *Controller) admissionEvent(state string) {
+	if os.Getenv("INVOCATION_ID") == "" {
+		return
+	}
+	if info := c.currentInfo(); info != nil && info.Common != nil {
+		fmt.Fprintf(os.Stderr, "v2node-admission port=%d state=%s\n", info.Common.ServerPort, state)
+	}
+}
+
 func (c *Controller) StartContext(ctx context.Context, x *core.V2Core) (err error) {
 	// Init Core
 	c.server = x
-	var limiterAdded bool
-	var nodeAdded bool
-	defer func() {
-		if err == nil {
-			return
-		}
-		if nodeAdded && c.server != nil && c.tag != "" {
-			if delErr := c.server.DelNode(c.tag); delErr != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": delErr,
-				}).Warn("Cleanup node after failed start failed")
-			}
-		}
-		if limiterAdded && c.tag != "" {
-			limiter.DeleteLimiter(c.tag)
-		}
-	}()
 	// First fetch Node Info
 	node := c.info
 	if node == nil {
@@ -89,6 +84,27 @@ func (c *Controller) StartContext(ctx context.Context, x *core.V2Core) (err erro
 	if node == nil {
 		return fmt.Errorf("node info is empty")
 	}
+	// Bind once with no users. Accounting retries must not tear down the
+	// listener or grant access using a pre-recovery user snapshot.
+	if !c.awaitingAdmission {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if node.Security == panel.Tls {
+			if err := c.requestCert(); err != nil {
+				return fmt.Errorf("request cert: %w", err)
+			}
+		}
+		c.limiter = limiter.AddLimiter(node.Type, node.Tag, nil, nil)
+		if err := c.server.AddNode(node.Tag, node); err != nil {
+			limiter.DeleteLimiter(node.Tag)
+			c.limiter = nil
+			return fmt.Errorf("add node: %w", err)
+		}
+		c.tag = node.Tag
+		c.awaitingAdmission = true
+		c.admissionEvent("waiting")
+	}
 	startCtx, cancel := panelRequestContext(ctx)
 	err = c.apiClient.FlushTraffic(startCtx, func() ([]panel.UserTraffic, error) { return nil, nil },
 		func([]panel.UserTraffic) error { return nil }, func([]int) error { return nil })
@@ -102,9 +118,11 @@ func (c *Controller) StartContext(ctx context.Context, x *core.V2Core) (err erro
 	cancel()
 	if err != nil {
 		return fmt.Errorf("get initial users: %w", err)
-	} else if snapshot != nil {
-		c.userList = snapshot.Users
+	} else if snapshot == nil {
+		c.apiClient.InvalidateUsers()
+		return fmt.Errorf("initial users response has no snapshot")
 	}
+	c.userList = snapshot.Users
 	if len(c.userList) == 0 {
 		log.WithField("tag", node.Tag).Warn("User list is empty, start node without users")
 	}
@@ -118,40 +136,34 @@ func (c *Controller) StartContext(ctx context.Context, x *core.V2Core) (err erro
 		}).Warn("Get alive list failed, continue with empty alive list")
 		c.aliveMap = make(map[int]int)
 	}
-	c.tag = node.Tag
 	if err = ctx.Err(); err != nil {
 		return err
 	}
 
-	// add limiter
-	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
-	c.limiter = l
-	limiterAdded = true
-	if node.Security == panel.Tls {
-		err = c.requestCert()
-		if err != nil {
-			return fmt.Errorf("request cert error: %s", err)
-		}
-	}
-	// Add new tag
-	err = c.server.AddNode(c.tag, node)
-	if err != nil {
-		return fmt.Errorf("add new node error: %s", err)
-	}
-	nodeAdded = true
+	c.limiter.UpdateAliveList(c.aliveMap)
+	c.limiter.UpdateUser(c.tag, c.userList, nil, nil)
 	added, err := c.server.AddUsers(&core.AddUsersParams{
 		Tag:      c.tag,
 		Users:    c.userList,
 		NodeInfo: node,
 	})
 	if err != nil {
+		// A failed activation cannot leave a partially authorized listener.
+		if delErr := c.server.DelNode(c.tag); delErr != nil {
+			return fmt.Errorf("rollback admission: %w (activation: %v)", delErr, err)
+		}
+		limiter.DeleteLimiter(c.tag)
+		c.awaitingAdmission = false
+		c.tag = ""
 		return fmt.Errorf("add users error: %s", err)
 	}
+	c.awaitingAdmission = false
 	log.WithField("tag", c.tag).Infof("Added %d new users", added)
 	c.info = node
 	c.apiClient.CommitUsers(snapshot)
 	c.apiClient.CommitNodeInfo(node)
 	c.startTasks(node)
+	c.admissionEvent("ready")
 	return nil
 }
 
@@ -197,6 +209,7 @@ func (c *Controller) CloseContext(ctx context.Context) error {
 	if c.server == nil || c.tag == "" {
 		return nil
 	}
+	c.admissionEvent("closing")
 	if err := c.server.QuiesceNode(c.tag); err != nil {
 		return err
 	}

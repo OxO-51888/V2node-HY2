@@ -8,9 +8,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -29,6 +31,8 @@ import (
 	"time"
 
 	hyclient "github.com/apernet/hysteria/core/v2/client"
+	hyerrors "github.com/apernet/hysteria/core/v2/errors"
+	"github.com/apernet/quic-go/http3"
 )
 
 func TestContractRuntimeChild(t *testing.T) {
@@ -43,14 +47,18 @@ func TestContractRuntimeChild(t *testing.T) {
 // Runs the real command, six controllers, QUIC listeners and echo traffic.
 // Every endpoint and database fixture is private to this test.
 func TestContractRuntimeProcess(t *testing.T) {
-	testContractRuntimeProcess(t, false)
+	testContractRuntimeProcess(t, false, false)
 }
 
 func TestContractRuntimeIsolation(t *testing.T) {
-	testContractRuntimeProcess(t, true)
+	testContractRuntimeProcess(t, true, false)
 }
 
-func testContractRuntimeProcess(t *testing.T, isolation bool) {
+func TestContractRuntimePendingAdmission(t *testing.T) {
+	testContractRuntimeProcess(t, false, true)
+}
+
+func testContractRuntimeProcess(t *testing.T, isolation, pending bool) {
 	dir := t.TempDir()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{"fixture.invalid"}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
@@ -72,6 +80,9 @@ func testContractRuntimeProcess(t *testing.T, isolation bool) {
 		sock.Close()
 	}
 	var slow, revoked atomic.Bool
+	var holdStartup atomic.Bool
+	holdStartup.Store(pending)
+	var refused atomic.Int64
 	var heartbeats, blocked, configReads atomic.Int64
 	var billingMu sync.Mutex
 	sequences := map[int]uint64{}
@@ -88,8 +99,12 @@ func testContractRuntimeProcess(t *testing.T, isolation bool) {
 		switch strings.TrimPrefix(r.URL.Path, "/api/v2/server/hy2/") {
 		case "config":
 			configReads.Add(1)
+			serverName := "fixture.invalid"
+			if pending && id == 1 {
+				serverName = "ovo.fixture.invalid"
+			}
 			json.NewEncoder(w).Encode(map[string]any{"protocol": "hysteria2", "listen_ip": "127.0.0.1", "server_port": ports[id-1], "tls": 1, "up_mbps": 100, "down_mbps": 100,
-				"tls_settings": map[string]any{"server_name": "fixture.invalid", "cert_mode": "file", "cert_file": certPath, "key_file": keyPath},
+				"tls_settings": map[string]any{"server_name": serverName, "cert_mode": "file", "cert_file": certPath, "key_file": keyPath},
 				"base_config":  map[string]any{"push_interval": 5, "pull_interval": 5}})
 		case "users":
 			users := []map[string]any{}
@@ -112,6 +127,11 @@ func testContractRuntimeProcess(t *testing.T, isolation bool) {
 				w.Write([]byte(`{"alive":{}}`))
 			}
 		case "traffic":
+			if id == 1 && holdStartup.Load() {
+				refused.Add(1)
+				w.WriteHeader(520)
+				return
+			}
 			if slow.Load() {
 				blocked.Add(1)
 				select {
@@ -179,12 +199,14 @@ func testContractRuntimeProcess(t *testing.T, isolation bool) {
 	cfg, _ := json.Marshal(map[string]any{"Log": map[string]any{"Level": "info"}, "Nodes": nodes})
 	cfgPath := filepath.Join(dir, "config.json")
 	os.WriteFile(cfgPath, cfg, 0600)
-	if isolation {
+	if isolation || pending {
 		os.MkdirAll(filepath.Join(dir, "state"), 0700)
 		billingMu.Lock()
 		for id := 1; id <= 6; id++ {
-			sequences[id] = 2
-			digests[id] = strings.Repeat("a", 64)
+			if isolation {
+				sequences[id] = 2
+				digests[id] = strings.Repeat("a", 64)
+			}
 			identity := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", api.URL, id)))
 			state := fmt.Sprintf(`{"version":1,"next":1,"pending":{"sequence":1,"rows":[{"uid":%d,"u":7,"d":11}]}}`, id)
 			if err := os.WriteFile(filepath.Join(dir, "state", fmt.Sprintf("%x.json", identity[:16])), []byte(state), 0600); err != nil {
@@ -197,7 +219,13 @@ func testContractRuntimeProcess(t *testing.T, isolation bool) {
 	var done chan error
 	start := func() {
 		child = exec.Command(os.Args[0], "-test.run=^TestContractRuntimeChild$", "-test.v")
+		if bin := os.Getenv("V2NODE_TEST_BINARY"); bin != "" {
+			child = exec.Command(bin, "server", "--watch", "--config", cfgPath)
+		}
 		child.Env = append(os.Environ(), "HY2_RUNTIME_CHILD=1", "HY2_RUNTIME_CONFIG="+cfgPath)
+		if pending {
+			child.Env = append(child.Env, "INVOCATION_ID=00000000000000000000000000000001")
+		}
 		logFile, e := os.OpenFile(filepath.Join(dir, "child.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if e != nil {
 			t.Fatal(e)
@@ -238,6 +266,9 @@ func testContractRuntimeProcess(t *testing.T, isolation bool) {
 	connect := func(id int) hyclient.Client {
 		addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: ports[id-1]}
 		deadline := time.Now().Add(15 * time.Second)
+		if pending && id == 1 {
+			deadline = time.Now().Add(55 * time.Second)
+		}
 		for {
 			c, _, e := hyclient.NewClient(&hyclient.Config{ServerAddr: addr, Auth: fmt.Sprintf("user-%d", id), TLSConfig: hyclient.TLSConfig{InsecureSkipVerify: true}})
 			if e == nil {
@@ -268,6 +299,100 @@ func testContractRuntimeProcess(t *testing.T, isolation bool) {
 		return e
 	}
 	start()
+	if pending {
+		checkMarker := func(ready bool) {
+			t.Helper()
+			logs, e := os.ReadFile(filepath.Join(dir, "child.log"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			stem := fmt.Sprintf("v2node-admission port=%d state=", ports[0])
+			if !bytes.Contains(logs, []byte(stem+"waiting\n")) || bytes.Contains(logs, []byte(stem+"ready\n")) != ready {
+				t.Fatalf("incorrect admission readiness marker (expected ready=%v)", ready)
+			}
+		}
+		end := time.Now().Add(12 * time.Second)
+		for refused.Load() == 0 && time.Now().Before(end) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if refused.Load() == 0 {
+			t.Fatal("fixture did not receive pending traffic")
+		}
+		pool := x509.NewCertPool()
+		leaf, e := x509.ParseCertificate(der)
+		if e != nil {
+			t.Fatal(e)
+		}
+		pool.AddCert(leaf)
+		tr := &http3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "fixture.invalid"}}
+		defer tr.Close()
+		hc := http.Client{Timeout: 4 * time.Second, Transport: tr}
+		addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: ports[0]}
+		page := func(path string, status int, want string) {
+			t.Helper()
+			res, e := hc.Get("https://" + addr.String() + path)
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer res.Body.Close()
+			b, e := io.ReadAll(res.Body)
+			if e != nil || res.ProtoMajor != 3 || res.StatusCode != status || !strings.Contains(string(b), want) {
+				t.Fatalf("http3 %s: status=%d", path, res.StatusCode)
+			}
+		}
+		page("/missing-test-resource.css", 404, "not found")
+		checkMarker(false)
+		if os.Getenv("V2NODE_TEST_EXPECT_PAGE") == "1" {
+			page("/", 200, "isolated-pending-page")
+		}
+		if c, _, e := hyclient.NewClient(&hyclient.Config{ServerAddr: addr, Auth: "user-1", TLSConfig: hyclient.TLSConfig{RootCAs: pool, ServerName: "fixture.invalid"}}); e == nil {
+			c.Close()
+			t.Fatal("user admitted while accounting unavailable")
+		} else {
+			var denied hyerrors.AuthError
+			if !errors.As(e, &denied) || denied.StatusCode != http.StatusMethodNotAllowed {
+				t.Fatalf("expected a live server refusing authentication, got %v", e)
+			}
+		}
+		for id := 2; id <= 6; id++ {
+			c := connect(id)
+			e := echo(c)
+			c.Close()
+			if e != nil {
+				t.Fatal(e)
+			}
+		}
+		billingMu.Lock()
+		before := billed[1]
+		billingMu.Unlock()
+		if before != 0 {
+			t.Fatal("pending charge changed during outage")
+		}
+		holdStartup.Store(false)
+		c := connect(1)
+		billingMu.Lock()
+		amount, seq := billed[1], sequences[1]
+		billingMu.Unlock()
+		if amount != 18 || seq != 1 {
+			c.Close()
+			t.Fatalf("replay: charged=%d sequence=%d", amount, seq)
+		}
+		errs := make(chan error, 12)
+		for range 12 {
+			go func() { errs <- echo(c) }()
+		}
+		for range 12 {
+			if e := <-errs; e != nil {
+				c.Close()
+				t.Fatal(e)
+			}
+		}
+		c.Close()
+		stop()
+		checkMarker(true)
+		t.Log("pending accounting: H3 available, forwarding denied, other five sites forwarded, single charge after recovery, same process")
+		return
+	}
 	clients := make([]hyclient.Client, 6)
 	defer func() {
 		for _, c := range clients {
