@@ -22,6 +22,15 @@ the override and restart to restore the default. On systemd the installer
 supplies a vendor default; an existing administrator override such as
 `70-hy2-force-bandwidth.conf` set to `false` stays in effect after reinstall.
 
+## Static Site Pages
+
+Place the site's public `index.html` and referenced static assets under
+`/etc/v2node/masq/<site>/`. Replacing a file atomically is sufficient; no
+service restart is needed to refresh a page. The handler serves GET and HEAD
+for public web file types only. It does not list directories or serve files
+outside the site's root. A missing or empty homepage returns 503 instead of
+a successful blank page. No publication URLs are bundled in this repository.
+
 ## UDP Receive Buffer
 
 Each HY2 listener requests a 32 MiB socket receive buffer before QUIC starts.

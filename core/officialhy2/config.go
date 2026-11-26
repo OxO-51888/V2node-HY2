@@ -3,11 +3,9 @@ package officialhy2
 import (
 	"crypto/tls"
 	"fmt"
-	"html"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,12 +51,6 @@ type masqHandlerLogWrapper struct {
 	handler http.Handler
 	quic    bool
 	logger  *zap.Logger
-}
-
-type staticMasqHandler struct {
-	site        string
-	content     []byte
-	contentType string
 }
 
 func (m *masqHandlerLogWrapper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -414,33 +406,10 @@ var defaultUnlockDomains = []string{
 }
 
 func (n *Node) getMasqHandler() http.Handler {
-	handler := n.getStaticMasqHandler()
 	return &masqHandlerLogWrapper{
-		handler: handler,
+		handler: sitePageHandler{root: defaultMasqRoot, site: n.masqSite()},
 		quic:    true,
 		logger:  n.events.logger,
-	}
-}
-
-func (n *Node) getStaticMasqHandler() http.Handler {
-	site := n.masqSite()
-	if site == "" {
-		return defaultMasqHandler("v2node")
-	}
-	indexPath := filepath.Join(defaultMasqRoot, site, "index.html")
-	content, err := os.ReadFile(indexPath)
-	if err != nil || len(content) == 0 {
-		n.events.logger.Warn("masquerade page not found",
-			zap.String("tag", n.tag),
-			zap.String("site", site),
-			zap.String("path", indexPath),
-			zap.Error(err))
-		return defaultMasqHandler(site)
-	}
-	return &staticMasqHandler{
-		site:        site,
-		content:     content,
-		contentType: "text/html; charset=utf-8",
 	}
 }
 
@@ -459,28 +428,6 @@ func (n *Node) masqSite() string {
 		return site
 	}
 	return masqSiteByPort(n.info.Common.ServerPort)
-}
-
-func (h *staticMasqHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", h.contentType)
-	w.Header().Set("Cache-Control", "public, max-age=300")
-	w.Header().Set("X-Robots-Tag", "noindex")
-	_, _ = w.Write(h.content)
-}
-
-func defaultMasqHandler(site string) http.Handler {
-	content := []byte("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" +
-		html.EscapeString(site) +
-		"</title></head><body></body></html>")
-	return &staticMasqHandler{
-		site:        site,
-		content:     content,
-		contentType: "text/html; charset=utf-8",
-	}
 }
 
 func masqSiteByPort(port int) string {
