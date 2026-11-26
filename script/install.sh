@@ -509,6 +509,16 @@ stage_v2node_release() {
     return 1
 }
 
+install_systemd_bandwidth_default() {
+    local dir="$1/v2node.service.d" tmp
+    install -d -m 0755 "$dir" || return 1
+    tmp=$(mktemp "$dir/.bandwidth-XXXXXX") || return 1
+    printf '%s\n' '[Service]' 'Environment=V2NODE_FORCE_SERVER_BANDWIDTH=true' > "$tmp" &&
+        chmod 0644 "$tmp" && mv -f "$tmp" "$dir/00-v2node-bandwidth-default.conf" && return 0
+    rm -f -- "$tmp"
+    return 1
+}
+
 install_v2node() {
     local version_param="$1" stage member
     last_version="${version_param:-latest}"
@@ -542,6 +552,7 @@ description="v2node"
 command="/usr/local/v2node/v2node"
 command_args="server"
 command_user="root"
+export V2NODE_FORCE_SERVER_BANDWIDTH="\${V2NODE_FORCE_SERVER_BANDWIDTH-true}"
 
 pidfile="/run/v2node.pid"
 command_background="yes"
@@ -554,6 +565,8 @@ EOF
         rc-update add v2node default
         echo -e "${green}v2node ${last_version}${plain} 安装完成，已设置开机自启"
     else
+        # Onboarding may rewrite the main unit. Keep the vendor default separate from admin overrides.
+        install_systemd_bandwidth_default /usr/lib/systemd/system || return 1
         rm /etc/systemd/system/v2node.service -f
         cat <<EOF > /etc/systemd/system/v2node.service
 [Unit]

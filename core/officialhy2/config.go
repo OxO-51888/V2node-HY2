@@ -262,7 +262,7 @@ func (n *Node) getConn(info *panel.NodeInfo) (net.PacketConn, error) {
 
 func (n *Node) getBandwidthConfig(info *panel.NodeInfo) (*server.BandwidthConfig, error) {
 	const key = "V2NODE_FORCE_SERVER_BANDWIDTH"
-	var force bool
+	force := true
 	if raw, ok := os.LookupEnv(key); ok {
 		v, err := strconv.ParseBool(strings.TrimSpace(raw))
 		if err != nil {

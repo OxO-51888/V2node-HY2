@@ -101,7 +101,7 @@ func TestForceServerBandwidthSwitch(t *testing.T) {
 		value string
 		want  bool
 		bad   bool
-	}{{"unset", false, false}, {"true", true, false}, {"false", false, false}, {"oops", false, true}, {"", false, true}} {
+	}{{"unset", true, false}, {"true", true, false}, {"false", false, false}, {"oops", false, true}, {"", false, true}} {
 		t.Run(tc.value, func(t *testing.T) {
 			t.Setenv(key, tc.value)
 			if tc.value == "unset" {

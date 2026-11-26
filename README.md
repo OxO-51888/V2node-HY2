@@ -14,11 +14,13 @@ unmodified panel. See [the API contract](docs/panel-contract.md).
 ## Server Bandwidth Policy
 
 `V2NODE_FORCE_SERVER_BANDWIDTH` controls the HY2 server bandwidth policy for
-all listeners in one process. Unset or `false` uses normal HY2 negotiation
-with the client's bandwidth settings. Set `true` to force the server policy.
+all listeners in one process. Unset or `true` forces the server bandwidth policy.
+Set `false` to use normal HY2 negotiation with the client's bandwidth settings.
 Neither setting changes panel rates, user quotas, or blocking rules. Set the
 environment variable on the service and restart it to apply the change. Remove
-the override and restart to restore the default.
+the override and restart to restore the default. On systemd the installer
+supplies a vendor default; an existing administrator override such as
+`70-hy2-force-bandwidth.conf` set to `false` stays in effect after reinstall.
 
 ## UDP Receive Buffer
 
