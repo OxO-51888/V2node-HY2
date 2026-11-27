@@ -17,6 +17,7 @@ import (
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/outbounds"
+	"github.com/apernet/hysteria/extras/v2/outbounds/acl"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/zap"
 )
@@ -316,7 +317,11 @@ func (n *Node) getOutboundConfig() (server.Outbound, error) {
 	if unlockOutbound != "" {
 		rules := n.getUnlockRules(unlockOutbound)
 		if rules != "" {
-			aclOutbound, err := outbounds.NewACLEngineFromString(rules, entries, nil)
+			translated, err := acl.TranslateText(rules, "unlock rules")
+			if err != nil {
+				return nil, fmt.Errorf("translate unlock acl: %w", err)
+			}
+			aclOutbound, err := outbounds.NewACLEngine(translated, entries, nil)
 			if err != nil {
 				return nil, fmt.Errorf("build unlock acl: %w", err)
 			}

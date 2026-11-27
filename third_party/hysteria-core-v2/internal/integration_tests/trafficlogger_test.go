@@ -61,8 +61,11 @@ func TestClientServerTrafficLoggerTCP(t *testing.T) {
 		sobConnChCloseFunc()
 		return nil
 	})
-	serverOb.EXPECT().TCP(addr).Return(sobConn, nil).Once()
-	trafficLogger.EXPECT().TraceStream(mock.Anything, mock.Anything).Return().Once()
+	serverOb.EXPECT().TCP(mock.Anything, addr).Return(sobConn, nil).Once()
+	traced := make(chan *server.StreamStats, 1)
+	trafficLogger.EXPECT().TraceStream(mock.Anything, mock.Anything).Run(func(_ server.HyStream, stats *server.StreamStats) {
+		traced <- stats
+	}).Return().Once()
 
 	conn, err := c.TCP(addr)
 	assert.NoError(t, err)
@@ -96,6 +99,15 @@ func TestClientServerTrafficLoggerTCP(t *testing.T) {
 	// The client should be disconnected
 	_, err = c.TCP("whatever")
 	assert.Error(t, err)
+
+	// Mock cleanup reflects over the recorded stats. Wait for the final atomic
+	// state write before allowing that non-atomic reflection to run.
+	select {
+	case stats := <-traced:
+		assert.Eventually(t, func() bool { return stats.State.Load() == server.StreamStateClosed }, 3*time.Second, time.Millisecond)
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream stats were not traced")
+	}
 }
 
 // TestClientServerTrafficLoggerUDP tests that the traffic logger is correctly called for UDP sessions,
@@ -145,7 +157,7 @@ func TestClientServerTrafficLoggerUDP(t *testing.T) {
 		sobConnChCloseFunc()
 		return nil
 	})
-	serverOb.EXPECT().UDP(addr).Return(sobConn, nil).Once()
+	serverOb.EXPECT().UDP(mock.Anything, addr).Return(sobConn, nil).Once()
 
 	conn, err := c.UDP()
 	assert.NoError(t, err)

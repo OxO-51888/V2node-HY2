@@ -24,19 +24,21 @@ type cachedAddrEx struct {
 	ex  *outbounds.AddrEx
 }
 
-func (a *fastOutboundAdapter) TCP(reqAddr string) (net.Conn, error) {
+func (a *fastOutboundAdapter) TCP(info *server.RequestInfo, reqAddr string) (net.Conn, error) {
 	addr, err := parseAddrEx(reqAddr)
 	if err != nil {
 		return nil, err
 	}
+	addr.Info = info
 	return a.outbound.TCP(addr)
 }
 
-func (a *fastOutboundAdapter) UDP(reqAddr string) (server.UDPConn, error) {
+func (a *fastOutboundAdapter) UDP(info *server.RequestInfo, reqAddr string) (server.UDPConn, error) {
 	addr, err := parseAddrEx(reqAddr)
 	if err != nil {
 		return nil, err
 	}
+	addr.Info = info
 	conn, err := a.outbound.UDP(addr)
 	if err != nil {
 		return nil, err
@@ -44,11 +46,12 @@ func (a *fastOutboundAdapter) UDP(reqAddr string) (server.UDPConn, error) {
 	return &fastUDPConnAdapter{conn: conn}, nil
 }
 
-func (a *fastOutboundAdapter) CheckUDP(reqAddr string) error {
+func (a *fastOutboundAdapter) CheckUDP(info *server.RequestInfo, reqAddr string) error {
 	addr, err := parseAddrEx(reqAddr)
 	if err != nil {
 		return err
 	}
+	addr.Info = info
 	return a.outbound.CheckUDP(addr)
 }
 

@@ -233,7 +233,14 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !h.config.DisableUDP {
 				go func() {
 					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
+						&udpIOImpl{
+							Conn:          h.conn,
+							AuthID:        id,
+							TrafficLogger: h.config.TrafficLogger,
+							RequestHook:   h.config.RequestHook,
+							Outbound:      h.config.Outbound,
+							RequestInfo:   &RequestInfo{AuthID: id, ClientAddr: h.conn.RemoteAddr()},
+						},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
 						h.config.UDPIdleTimeout,
 					)
@@ -334,7 +341,10 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream, authID string) {
 	if streamStats != nil {
 		streamStats.State.Store(StreamStateConnecting)
 	}
-	tConn, err := h.config.Outbound.TCP(reqAddr)
+	tConn, err := h.config.Outbound.TCP(&RequestInfo{
+		AuthID:     authID,
+		ClientAddr: h.conn.RemoteAddr(),
+	}, reqAddr)
 	if err != nil {
 		if !hooked {
 			_ = protocol.WriteTCPResponse(stream, false, err.Error())
@@ -408,6 +418,9 @@ type udpIOImpl struct {
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
 	Outbound      Outbound
+	RequestInfo   *RequestInfo
+
+	lastAddr string // Address of the last message received
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
@@ -417,11 +430,12 @@ func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 			// Connection error, this will stop the session manager
 			return nil, err
 		}
-		udpMsg, err := protocol.ParseUDPMessage(msg)
+		udpMsg, err := protocol.ParseUDPMessageReuseAddr(msg, io.lastAddr)
 		if err != nil {
 			// Invalid message, this is fine - just wait for the next
 			continue
 		}
+		io.lastAddr = udpMsg.Addr
 		if io.TrafficLogger != nil {
 			ok := io.TrafficLogger.LogTraffic(io.AuthID, uint64(len(udpMsg.Data)), 0)
 			if !ok {
@@ -451,20 +465,20 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	return io.Conn.SendDatagram(buf[:msgN])
 }
 
-func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
+func (io *udpIOImpl) Hook(packets [][]byte, reqAddr *string) (bool, error) {
 	if io.RequestHook != nil && io.RequestHook.Check(true, *reqAddr) {
-		return io.RequestHook.UDP(data, reqAddr)
+		return io.RequestHook.UDP(packets, reqAddr)
 	} else {
-		return nil
+		return true, nil
 	}
 }
 
 func (io *udpIOImpl) UDP(reqAddr string) (UDPConn, error) {
-	return io.Outbound.UDP(reqAddr)
+	return io.Outbound.UDP(io.RequestInfo, reqAddr)
 }
 
 func (io *udpIOImpl) CheckUDP(reqAddr string) error {
-	return io.Outbound.CheckUDP(reqAddr)
+	return io.Outbound.CheckUDP(io.RequestInfo, reqAddr)
 }
 
 type udpEventLoggerImpl struct {
